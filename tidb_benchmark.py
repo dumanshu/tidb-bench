@@ -40,15 +40,15 @@ WORKLOAD_PROFILES = {
 
 MULTI_PHASE_PROFILES = {
     "stress": {
-        "description": "CPU stress test: ramp-up to overload, sustain peak, recover to 60%",
+        "description": "CPU stress test: ramp-up, adaptive overload until QPS plateaus, then recover",
         "phases": [
             {"name": "warmup", "threads": 32, "duration": 30},
             {"name": "ramp_up", "threads": 64, "duration": 30},
-            {"name": "overload", "threads": 128, "duration": 45},
+            {"name": "overload", "threads": 128, "duration": 30, "adaptive": True, "thread_step": 32, "max_threads": 512, "plateau_threshold": 0.05},
             {"name": "recovery", "threads": 64, "duration": 30},
             {"name": "sustained", "threads": 48, "duration": 45},
         ],
-        "total_duration": 180,
+        "total_duration": "adaptive",
     },
     "scaling": {
         "description": "Traffic scaling test: gradual ramp-up then ramp-down",
@@ -472,6 +472,102 @@ def print_metrics_summary(metrics: dict):
     log("=" * 60)
 
 
+def run_adaptive_phase(
+    host: str,
+    key_path: Path,
+    phase: dict,
+    workload: str,
+    tables: int,
+    table_size: int,
+    report_interval: int,
+    port: int = DEFAULT_PORT,
+    database: str = DEFAULT_DATABASE,
+) -> list:
+    """Run adaptive overload phase: increase threads until QPS plateaus."""
+    results = []
+    start_threads = phase["threads"]
+    thread_step = phase.get("thread_step", 32)
+    max_threads = phase.get("max_threads", 512)
+    plateau_threshold = phase.get("plateau_threshold", 0.05)  # 5% improvement threshold
+    phase_duration = phase.get("duration", 30)
+    
+    current_threads = start_threads
+    prev_qps = 0
+    iteration = 0
+    peak_qps = 0
+    peak_threads = start_threads
+    
+    log(f"    Adaptive mode: starting at {start_threads} threads, step={thread_step}, max={max_threads}")
+    log(f"    Will stop when QPS improvement < {plateau_threshold*100:.0f}% threshold")
+    
+    while current_threads <= max_threads:
+        iteration += 1
+        log(f"")
+        log(f"    >> Iteration {iteration}: {current_threads} threads, {phase_duration}s")
+        
+        result = ssh_capture(host, f"""
+sysbench {workload} \\
+    --mysql-host=127.0.0.1 \\
+    --mysql-port={port} \\
+    --mysql-user=root \\
+    --mysql-db={database} \\
+    --tables={tables} \\
+    --table-size={table_size} \\
+    --threads={current_threads} \\
+    --time={phase_duration} \\
+    --report-interval={report_interval} \\
+    run 2>&1
+""", key_path)
+        
+        output = result.stdout
+        print(output)
+        
+        metrics = parse_sysbench_output(output, workload)
+        metrics["phase"] = f"overload_iter{iteration}"
+        metrics["threads"] = current_threads
+        metrics["duration"] = phase_duration
+        results.append(metrics)
+        
+        current_qps = metrics.get("throughput", {}).get("qps", 0)
+        tp = metrics.get("throughput", {})
+        lat = metrics.get("latency", {})
+        
+        # Track peak
+        if current_qps > peak_qps:
+            peak_qps = current_qps
+            peak_threads = current_threads
+        
+        # Calculate improvement
+        if prev_qps > 0:
+            improvement = (current_qps - prev_qps) / prev_qps
+            log(f"       QPS: {current_qps:,.1f} (prev: {prev_qps:,.1f}, change: {improvement*100:+.1f}%)")
+            log(f"       P95: {lat.get('p95_ms', 'N/A')}ms, P99: {lat.get('p99_ms', 'N/A')}ms")
+            
+            # Check if we've plateaued (improvement below threshold or negative)
+            if improvement < plateau_threshold:
+                log(f"")
+                log(f"    !! QPS plateau detected: improvement {improvement*100:.1f}% < {plateau_threshold*100:.0f}% threshold")
+                log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
+                break
+        else:
+            log(f"       QPS: {current_qps:,.1f} (baseline)")
+            log(f"       P95: {lat.get('p95_ms', 'N/A')}ms, P99: {lat.get('p99_ms', 'N/A')}ms")
+        
+        prev_qps = current_qps
+        current_threads += thread_step
+        
+        # Brief pause between iterations to let system stabilize
+        if current_threads <= max_threads:
+            log(f"       Ramping up to {current_threads} threads...")
+            time.sleep(3)
+    
+    if current_threads > max_threads:
+        log(f"    !! Reached max threads ({max_threads}) without plateau")
+        log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
+    
+    return results
+
+
 def run_multi_phase_benchmark(
     host: str,
     key_path: Path,
@@ -489,7 +585,14 @@ def run_multi_phase_benchmark(
     log("=" * 70)
     log(f"MULTI-PHASE BENCHMARK: {profile_name.upper()}")
     log(f"  {profile['description']}")
-    log(f"  Total duration: {profile['total_duration']}s ({len(profile['phases'])} phases)")
+    
+    # Calculate total duration (may be adaptive)
+    total_phases = len(profile['phases'])
+    if profile['total_duration'] == "adaptive":
+        estimated = sum(p.get('duration', 30) for p in profile['phases'])
+        log(f"  Phases: {total_phases} (adaptive duration, min ~{estimated}s)")
+    else:
+        log(f"  Total duration: {profile['total_duration']}s ({total_phases} phases)")
     log("=" * 70)
     
     all_results = []
@@ -498,13 +601,27 @@ def run_multi_phase_benchmark(
         phase_name = phase["name"]
         threads = phase["threads"]
         duration = phase["duration"]
+        is_adaptive = phase.get("adaptive", False)
         
         log("")
         log(f">>> PHASE {i+1}/{len(profile['phases'])}: {phase_name.upper()}")
-        log(f"    Threads: {threads}, Duration: {duration}s")
+        if is_adaptive:
+            log(f"    Mode: ADAPTIVE (start={threads} threads, step={phase.get('thread_step', 32)}, max={phase.get('max_threads', 512)})")
+        else:
+            log(f"    Threads: {threads}, Duration: {duration}s")
         log("-" * 50)
         
-        result = ssh_capture(host, f"""
+        if is_adaptive:
+            # Run adaptive overload phase
+            phase_results = run_adaptive_phase(
+                host, key_path, phase, workload,
+                tables, table_size, report_interval,
+                port, database
+            )
+            all_results.extend(phase_results)
+        else:
+            # Run standard fixed-duration phase
+            result = ssh_capture(host, f"""
 sysbench {workload} \\
     --mysql-host=127.0.0.1 \\
     --mysql-port={port} \\
@@ -517,19 +634,19 @@ sysbench {workload} \\
     --report-interval={report_interval} \\
     run 2>&1
 """, key_path)
-        
-        output = result.stdout
-        print(output)
-        
-        metrics = parse_sysbench_output(output, workload)
-        metrics["phase"] = phase_name
-        metrics["threads"] = threads
-        metrics["duration"] = duration
-        all_results.append(metrics)
-        
-        tp = metrics.get("throughput", {})
-        lat = metrics.get("latency", {})
-        log(f"    Phase Result: TPS={tp.get('tps', 0):,.1f} QPS={tp.get('qps', 0):,.1f} P95={lat.get('p95_ms', 'N/A')}ms")
+            
+            output = result.stdout
+            print(output)
+            
+            metrics = parse_sysbench_output(output, workload)
+            metrics["phase"] = phase_name
+            metrics["threads"] = threads
+            metrics["duration"] = duration
+            all_results.append(metrics)
+            
+            tp = metrics.get("throughput", {})
+            lat = metrics.get("latency", {})
+            log(f"    Phase Result: TPS={tp.get('tps', 0):,.1f} QPS={tp.get('qps', 0):,.1f} P95={lat.get('p95_ms', 'N/A')}ms")
     
     return all_results
 
@@ -779,12 +896,27 @@ def main():
     capture_metrics = args.capture_metrics and not args.no_metrics
     show_tidb_metrics = args.show_tidb_metrics and not args.no_tidb_metrics
     
-    total_duration = MULTI_PHASE_PROFILES[multi_phase]["total_duration"] if multi_phase else duration
+    # Calculate total_duration for metrics capture (handle adaptive case)
+    if multi_phase:
+        mp_profile = MULTI_PHASE_PROFILES[multi_phase]
+        if mp_profile["total_duration"] == "adaptive":
+            # Estimate duration: sum of fixed phases + max adaptive iterations
+            estimated = sum(p.get('duration', 30) for p in mp_profile['phases'])
+            # Add buffer for potential adaptive iterations (up to 10 iterations)
+            adaptive_phases = [p for p in mp_profile['phases'] if p.get('adaptive')]
+            for ap in adaptive_phases:
+                max_iters = (ap.get('max_threads', 512) - ap['threads']) // ap.get('thread_step', 32) + 1
+                estimated += max_iters * ap.get('duration', 30)
+            total_duration = estimated
+        else:
+            total_duration = mp_profile["total_duration"]
+    else:
+        total_duration = duration
     
     if capture_metrics:
         log("Starting background metrics capture (CPU, IOPS, memory)...")
         metrics_thread = start_metrics_capture(
-            host, key_path, total_duration + 60
+            host, key_path, total_duration + 120  # Extra buffer for adaptive
         )
 
     if multi_phase:
