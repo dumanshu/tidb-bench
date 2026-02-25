@@ -428,11 +428,11 @@ kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | head -10 || echo "ku
 
 
 def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, seed: str, port: int = DEFAULT_PORT):
-    """Print cluster configuration summary."""
+    """Print cluster configuration summary with EBS details."""
     log("")
-    log("=" * 70)
+    log("=" * 80)
     log("CLUSTER CONFIGURATION")
-    log("=" * 70)
+    log("=" * 80)
     
     # Get instance info
     inst_info = get_instance_info(region, profile, seed)
@@ -442,29 +442,57 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"TiDB Version: {cluster_info.get('tidb_version', 'unknown')}")
     log(f"Regions: {cluster_info.get('region_count', 'N/A')}")
     log("")
-    log(f"{'Component':<12} {'Count':>6} {'Instance':>14} {'vCPU':>6} {'Memory':>8}")
-    log("-" * 50)
     
-    # Determine instance type (assuming kind single-node setup uses host instance)
-    host_type = "c7g.2xlarge"  # Default
+    # Determine instance type
+    host_type = "c7g.4xlarge"  # Default (updated to larger instance)
     for inst in inst_info.get("instances", []):
         inst_type = inst.get("type")
         if inst_type:
             host_type = inst_type
             break
     
-    host_specs = AWS_COSTS["ec2"].get(host_type, {"vcpu": 8, "memory_gb": 16})
+    host_specs = AWS_COSTS["ec2"].get(host_type, {"vcpu": 16, "memory_gb": 32})
     
-    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
-    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
-    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
-    log(f"{'Host (EC2)':<12} {'1':>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
-    
-    # Quick cost preview (detailed costs shown after benchmark)
+    # Compute resources table
+    log("--- Compute Resources ---")
+    log(f"{'Component':<12} {'Count':>6} {'Instance':>14} {'vCPU':>6} {'Memory':>8}")
+    log("-" * 52)
+    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
+    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
+    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
+    log(f"{'Client (EC2)':<12} {'1':>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
     log("")
-    hourly = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.29)
-    log(f"EC2 Rate: ${hourly:.3f}/hr | Detailed costs shown after benchmark")
-    log("=" * 70)
+    
+    # EBS storage details
+    # In kind setup, all pods share the host's EBS volume
+    ebs_type = "gp3"
+    ebs_size_gb = 600  # Default root volume size
+    ebs_iops = 3000    # gp3 baseline IOPS
+    ebs_throughput = 125  # gp3 baseline MB/s
+    
+    log("--- Storage Resources ---")
+    log(f"{'Volume':<12} {'Type':>8} {'Size':>10} {'IOPS':>8} {'Throughput':>12}")
+    log("-" * 56)
+    log(f"{'Root EBS':<12} {ebs_type:>8} {ebs_size_gb:>8}GB {ebs_iops:>8} {ebs_throughput:>9}MB/s")
+    
+    # Calculate EBS costs
+    ebs_monthly = ebs_size_gb * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    log(f"{'':>12} EBS Cost: ${ebs_monthly:.2f}/month (${ebs_monthly/730:.4f}/hr)")
+    log("")
+    
+    # Network info
+    log("--- Network Configuration ---")
+    log(f"Cross-AZ transfer: ${AWS_COSTS['network']['cross_az_per_gb']:.3f}/GB (bidirectional)")
+    log(f"Same-AZ transfer:  ${AWS_COSTS['network']['same_az_per_gb']:.3f}/GB (free)")
+    log("")
+    
+    # Quick cost preview
+    hourly_compute = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.58)
+    hourly_storage = ebs_monthly / 730
+    total_hourly = hourly_compute + hourly_storage
+    log(f"--- Hourly Rate Preview ---")
+    log(f"EC2 Compute: ${hourly_compute:.3f}/hr | EBS Storage: ${hourly_storage:.4f}/hr | Total: ${total_hourly:.3f}/hr")
+    log("=" * 80)
 
 
 def start_resource_monitor(host: str, key_path: Path, interval: int = 60, 
