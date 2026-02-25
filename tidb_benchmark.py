@@ -29,6 +29,33 @@ DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_PORT = 4000
 DEFAULT_DATABASE = "sbtest"
 
+# TiDB session variables for benchmarking
+# These are safe for all workloads (read/write)
+SESSION_VARS_BASE = (
+    "SET SESSION tikv_client_read_timeout=5;"  # 5s timeout for TiKV reads
+    "SET SESSION max_execution_time=10000;"    # 10s max query execution
+)
+
+# Additional session vars for read-only workloads
+SESSION_VARS_READ_ONLY = (
+    "SET SESSION tidb_replica_read='closest-replicas';"  # Read from nearest replica
+)
+
+# MySQL errors to ignore during benchmark (improves resilience)
+# 1213: Deadlock, 1020: Record changed, 1205: Lock wait timeout, 1105: Deadline exceeded
+MYSQL_IGNORE_ERRORS = "1213,1020,1205,1105"
+
+# AWS cost estimates (us-east-1, on-demand)
+AWS_COSTS = {
+    "c7g.2xlarge": {"hourly": 0.29, "vcpu": 8, "memory_gb": 16},
+    "c7g.xlarge": {"hourly": 0.145, "vcpu": 4, "memory_gb": 8},
+    "c7g.4xlarge": {"hourly": 0.58, "vcpu": 16, "memory_gb": 32},
+    "m7g.2xlarge": {"hourly": 0.326, "vcpu": 8, "memory_gb": 32},
+    "m7g.4xlarge": {"hourly": 0.652, "vcpu": 16, "memory_gb": 64},
+    "ebs_gp3_gb_month": 0.08,
+    "cross_az_gb": 0.01,
+}
+
 WORKLOAD_PROFILES = {
     "quick": {"tables": 4, "table_size": 10000, "threads": 16, "duration": 30},
     "light": {"tables": 8, "table_size": 50000, "threads": 32, "duration": 60},
@@ -72,7 +99,7 @@ BOTO_CONFIG = Config(
 
 
 def ts():
-    return datetime.now().strftime("[%Y-%m-%dT%H:%M:%S%z]")
+    return datetime.now().strftime("[%Y-%m-%dT%H:%M:%S]")
 
 
 def log(msg):
@@ -102,6 +129,30 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
                 if ip:
                     return ip
     raise SystemExit("ERROR: Unable to discover TiDB host; specify --host explicitly.")
+
+
+def get_instance_info(region: str, profile: Optional[str], seed: str) -> dict:
+    """Get instance details for cost estimation."""
+    client = ec2_client(profile, region)
+    stack = f"tidb-loadtest-{seed}"
+    filters = [
+        {"Name": "tag:Project", "Values": [stack]},
+        {"Name": "instance-state-name", "Values": ["running"]},
+    ]
+    resp = client.describe_instances(Filters=filters)
+    info = {"instances": [], "az": None}
+    for reservation in resp.get("Reservations", []):
+        for inst in reservation.get("Instances", []):
+            tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
+            info["instances"].append({
+                "id": inst.get("InstanceId"),
+                "type": inst.get("InstanceType"),
+                "az": inst.get("Placement", {}).get("AvailabilityZone"),
+                "role": tags.get("Role", "unknown"),
+            })
+            if not info["az"]:
+                info["az"] = inst.get("Placement", {}).get("AvailabilityZone")
+    return info
 
 
 def ssh_run(host: str, script: str, key_path: Path, strict: bool = True):
@@ -140,127 +191,287 @@ def ssh_capture(host: str, script: str, key_path: Path):
     return result
 
 
-def start_metrics_capture(
-    host: str,
-    key_path: Path,
-    duration: int,
-    output_dir: str = "/tmp/benchmark_metrics",
-) -> threading.Thread:
-    """Start background metrics capture (CPU, IOPS, memory) via SSH."""
-    
-    def capture_metrics():
-        script = f"""
-mkdir -p {output_dir}
-DURATION={duration}
+def get_cluster_info(host: str, key_path: Path, port: int = DEFAULT_PORT) -> dict:
+    """Get TiDB cluster configuration details."""
+    script = f"""
+mysql -h 127.0.0.1 -P {port} -u root -N -e "
+SELECT 'tidb_version', TIDB_VERSION();
+SELECT 'tidb_count', COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tidb';
+SELECT 'tikv_count', COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tikv';
+SELECT 'pd_count', COUNT(*) FROM information_schema.cluster_info WHERE TYPE='pd';
+SELECT 'region_count', COUNT(*) FROM information_schema.tikv_region_status;
+" 2>/dev/null || echo "cluster_info_error"
 
-# CPU utilization per core
-nohup mpstat -P ALL 1 $DURATION > {output_dir}/mpstat.log 2>&1 &
-
-# Memory and swap
-nohup vmstat 1 $DURATION > {output_dir}/vmstat.log 2>&1 &
-
-# Disk I/O statistics (IOPS, throughput, latency)
-nohup iostat -xdm 1 $DURATION > {output_dir}/iostat.log 2>&1 &
-
-# Network statistics
-nohup sar -n DEV 1 $DURATION > {output_dir}/network.log 2>&1 &
-
-echo "Metrics capture started for $DURATION seconds"
+# Get pod resource requests
+kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | head -10 || echo "kubectl_error"
 """
-        ssh_run(host, script, key_path, strict=False)
+    result = ssh_capture(host, script, key_path)
     
-    thread = threading.Thread(target=capture_metrics, daemon=True)
+    info = {
+        "tidb_version": "unknown",
+        "tidb_count": 0,
+        "tikv_count": 0,
+        "pd_count": 0,
+        "region_count": 0,
+        "pods": [],
+    }
+    
+    for line in result.stdout.split('\n'):
+        parts = line.strip().split('\t')
+        if len(parts) == 2:
+            key, val = parts
+            if key in info:
+                try:
+                    info[key] = int(val) if key.endswith('_count') else val
+                except ValueError:
+                    info[key] = val
+        elif line and not line.startswith("kubectl_error") and not line.startswith("cluster_info_error"):
+            # Parse kubectl top output: NAME CPU MEMORY
+            pod_parts = line.split()
+            if len(pod_parts) >= 3 and pod_parts[0].startswith("basic-"):
+                info["pods"].append({
+                    "name": pod_parts[0],
+                    "cpu": pod_parts[1],
+                    "memory": pod_parts[2],
+                })
+    
+    return info
+
+
+def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, seed: str, port: int = DEFAULT_PORT):
+    """Print cluster configuration summary with cost estimates."""
+    log("")
+    log("=" * 70)
+    log("CLUSTER CONFIGURATION")
+    log("=" * 70)
+    
+    # Get instance info
+    inst_info = get_instance_info(region, profile, seed)
+    cluster_info = get_cluster_info(host, key_path, port)
+    
+    log(f"Region: {region} | Zone: {inst_info.get('az', 'unknown')}")
+    log(f"TiDB Version: {cluster_info.get('tidb_version', 'unknown')}")
+    log(f"Regions: {cluster_info.get('region_count', 'N/A')}")
+    log("")
+    log(f"{'Component':<12} {'Count':>6} {'Instance':>14} {'vCPU':>6} {'Memory':>8}")
+    log("-" * 50)
+    
+    # Determine instance type (assuming kind single-node setup uses host instance)
+    host_type = "c7g.2xlarge"  # Default
+    for inst in inst_info.get("instances", []):
+        if inst.get("role") == "host":
+            host_type = inst.get("type", "c7g.2xlarge")
+            break
+    
+    host_specs = AWS_COSTS.get(host_type, {"vcpu": 8, "memory_gb": 16})
+    
+    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
+    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
+    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
+    log(f"{'Host':<12} {'1':>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
+    
+    # Cost estimate
+    log("")
+    log("--- Cost Estimate (us-east-1, on-demand, excl. client) ---")
+    hourly = AWS_COSTS.get(host_type, {}).get("hourly", 0.29)
+    daily = hourly * 24
+    log(f"EC2 Host: ${hourly:.2f}/hr (${daily:.2f}/day)")
+    log(f"EBS (est. 600GB gp3): ~${600 * 0.08 / 30:.2f}/day")
+    log(f"Total: ~${daily + 1.60:.2f}/day")
+    log("=" * 70)
+
+
+def start_resource_monitor(host: str, key_path: Path, interval: int = 60) -> threading.Thread:
+    """Start background thread that logs resource utilization every interval."""
+    stop_event = threading.Event()
+    
+    def monitor_resources():
+        while not stop_event.is_set():
+            script = """
+# Compact resource summary
+echo "--- $(date +%H:%M:%S) Resource Snapshot ---"
+
+# Client VM stats
+CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
+CONN=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';" 2>/dev/null || echo "N/A")
+echo "Client: CPU=${CPU}% Mem=${MEM} Conn=${CONN}"
+
+# Pod utilization (compact)
+echo "Pods:"
+kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "  %-20s CPU:%-6s Mem:%s\\n", $1, $2, $3}' | head -8 || echo "  N/A"
+echo ""
+"""
+            result = ssh_capture(host, script, key_path)
+            if result.stdout.strip():
+                for line in result.stdout.strip().split('\n'):
+                    log(line)
+            stop_event.wait(interval)
+    
+    thread = threading.Thread(target=monitor_resources, daemon=True)
+    thread.stop_event = stop_event
     thread.start()
     return thread
 
 
-def collect_tidb_metrics(host: str, key_path: Path, port: int = DEFAULT_PORT) -> dict:
-    """Collect TiDB-specific metrics via SQL queries."""
-    script = f"""
-mysql -h 127.0.0.1 -P {port} -u root -N -e "
-SELECT 'qps', VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Questions';
-SELECT 'uptime', VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Uptime';
-SELECT 'connections', VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';
-SELECT 'version', TIDB_VERSION();
-" 2>/dev/null || echo "tidb_metrics_error"
-
-kubectl get pods -n tidb-cluster -o wide 2>/dev/null | grep -E "^(NAME|basic-)" || true
-"""
-    result = ssh_capture(host, script, key_path)
-    return {"stdout": result.stdout, "stderr": result.stderr}
+def stop_resource_monitor(thread: threading.Thread):
+    """Stop the resource monitor thread."""
+    if hasattr(thread, 'stop_event'):
+        thread.stop_event.set()
 
 
-def fetch_metrics_summary(host: str, key_path: Path, output_dir: str = "/tmp/benchmark_metrics"):
-    """Fetch and summarize captured metrics after benchmark."""
-    log("=== System Metrics Summary ===")
+def build_sysbench_cmd(
+    workload: str,
+    tables: int,
+    table_size: int,
+    threads: int,
+    duration: int,
+    report_interval: int,
+    port: int = DEFAULT_PORT,
+    database: str = DEFAULT_DATABASE,
+    skip_trx: bool = False,
+) -> str:
+    """Build sysbench command with proper flags."""
+    cmd = f"""sysbench {workload} \\
+    --mysql-host=127.0.0.1 \\
+    --mysql-port={port} \\
+    --mysql-user=root \\
+    --mysql-db={database} \\
+    --tables={tables} \\
+    --table-size={table_size} \\
+    --threads={threads} \\
+    --time={duration} \\
+    --report-interval={report_interval} \\
+    --percentile=99 \\
+    --histogram \\
+    --mysql-ignore-errors={MYSQL_IGNORE_ERRORS}"""
     
-    script = f"""
-echo "--- CPU Summary (mpstat) ---"
-if [ -f {output_dir}/mpstat.log ]; then
-    tail -20 {output_dir}/mpstat.log | grep -E "^[0-9]|^Average" | head -10
-else
-    echo "No mpstat data"
-fi
-
-echo ""
-echo "--- Memory Summary (vmstat) ---"
-if [ -f {output_dir}/vmstat.log ]; then
-    head -2 {output_dir}/vmstat.log
-    tail -5 {output_dir}/vmstat.log
-else
-    echo "No vmstat data"
-fi
-
-echo ""
-echo "--- Disk I/O Summary (iostat) ---"
-if [ -f {output_dir}/iostat.log ]; then
-    tail -30 {output_dir}/iostat.log | grep -E "^Device|^nvme|^xvd|^sd" | tail -10
-else
-    echo "No iostat data"
-fi
-
-echo ""
-echo "--- Network Summary (sar) ---"
-if [ -f {output_dir}/network.log ]; then
-    tail -20 {output_dir}/network.log | grep -v "^$" | tail -8
-else
-    echo "No network data"
-fi
-"""
-    ssh_run(host, script, key_path, strict=False)
-
-
-def fetch_tidb_cluster_metrics(host: str, key_path: Path, port: int = DEFAULT_PORT):
-    """Fetch TiDB cluster health and region metrics."""
-    log("=== TiDB Cluster Metrics ===")
+    if skip_trx:
+        cmd += " \\\n    --skip_trx=true"
     
-    script = f"""
-echo "--- Region Count ---"
-mysql -h 127.0.0.1 -P {port} -u root -e "
-SELECT COUNT(*) as total_regions FROM information_schema.tikv_region_status;
-" 2>/dev/null || echo "Region query failed"
+    cmd += " \\\n    run 2>&1"
+    return cmd
 
-echo ""
-echo "--- Leader Distribution ---"
-mysql -h 127.0.0.1 -P {port} -u root -e "
-SELECT store_id, COUNT(*) as leader_count 
-FROM information_schema.tikv_region_status 
-WHERE is_leader = 1 
-GROUP BY store_id;
-" 2>/dev/null || echo "Leader query failed"
 
-echo ""
-echo "--- Cluster Info ---"
-mysql -h 127.0.0.1 -P {port} -u root -e "
-SELECT TYPE, INSTANCE, STATUS_ADDRESS, VERSION 
-FROM information_schema.cluster_info;
-" 2>/dev/null || echo "Cluster info query failed"
+def set_session_variables(host: str, key_path: Path, port: int, workload: str):
+    """Set TiDB session variables for benchmarking."""
+    session_vars = SESSION_VARS_BASE
+    if workload in ("oltp_read_only", "oltp_point_select"):
+        session_vars += SESSION_VARS_READ_ONLY
+    
+    log(f"Setting session variables for {workload}...")
+    # Note: sysbench doesn't support --init_connection in stock version
+    # Session vars are set per-connection by TiDB, we log what would be ideal
+    log(f"  Recommended: {session_vars.replace(';', '; ')}")
 
-echo ""
-echo "--- Pod Status ---"
-kubectl get pods -n tidb-cluster -o wide 2>/dev/null || true
-"""
-    ssh_run(host, script, key_path, strict=False)
+
+def parse_sysbench_output(output: str, workload: str) -> dict:
+    """Parse sysbench output and extract detailed metrics including errors."""
+    metrics = {
+        "workload": workload,
+        "transactions": {},
+        "queries": {},
+        "latency": {},
+        "throughput": {},
+        "errors": {"ignored": 0, "per_sec": 0.0},
+        "availability_pct": 100.0,
+    }
+    
+    lines = output.split('\n')
+    for i, line in enumerate(lines):
+        line = line.strip()
+        
+        # Query counts
+        if line.startswith("read:"):
+            try:
+                metrics["queries"]["read"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("write:"):
+            try:
+                metrics["queries"]["write"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("other:"):
+            try:
+                metrics["queries"]["other"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("total:"):
+            try:
+                metrics["queries"]["total"] = int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        
+        # Transactions and TPS
+        if "transactions:" in line and "per sec" in line:
+            parts = line.split()
+            for j, p in enumerate(parts):
+                if "per" in p and j > 0:
+                    try:
+                        metrics["throughput"]["tps"] = float(parts[j-1].strip('('))
+                        metrics["transactions"]["total"] = int(parts[1])
+                    except (ValueError, IndexError):
+                        pass
+        
+        # QPS
+        if "queries:" in line and "per sec" in line:
+            parts = line.split()
+            for j, p in enumerate(parts):
+                if "per" in p and j > 0:
+                    try:
+                        metrics["throughput"]["qps"] = float(parts[j-1].strip('('))
+                    except (ValueError, IndexError):
+                        pass
+        
+        # Ignored errors - critical for availability calculation
+        if "ignored errors:" in line:
+            parts = line.split()
+            try:
+                # Format: "ignored errors:      15      (0.50 per sec.)"
+                for j, p in enumerate(parts):
+                    if p == "errors:":
+                        metrics["errors"]["ignored"] = int(parts[j+1])
+                    if "per" in p and j > 0:
+                        metrics["errors"]["per_sec"] = float(parts[j-1].strip('('))
+            except (ValueError, IndexError):
+                pass
+        
+        # Latency metrics
+        if "min:" in line and "latency" not in line.lower():
+            try:
+                metrics["latency"]["min_ms"] = float(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif "avg:" in line:
+            try:
+                metrics["latency"]["avg_ms"] = float(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif "max:" in line:
+            try:
+                metrics["latency"]["max_ms"] = float(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif "95th percentile:" in line:
+            try:
+                metrics["latency"]["p95_ms"] = float(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+        elif "99th percentile:" in line or ("percentile:" in line.lower() and "95th" not in line):
+            # sysbench with --percentile=99 may output just "percentile:" or "99th percentile:"
+            try:
+                metrics["latency"]["p99_ms"] = float(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                pass
+    
+    # Calculate availability
+    total_txns = metrics["transactions"].get("total", 0)
+    ignored_errors = metrics["errors"].get("ignored", 0)
+    if total_txns + ignored_errors > 0:
+        metrics["availability_pct"] = (total_txns / (total_txns + ignored_errors)) * 100
+    
+    return metrics
 
 
 def run_sysbench_prepare(
@@ -326,125 +537,36 @@ def run_sysbench_benchmark(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
-    histogram: bool = True,
 ) -> dict:
     """Run sysbench benchmark and return parsed metrics."""
     log(f"Running sysbench {workload} benchmark")
-    log(f"  Tables: {tables}, Table size: {table_size}")
+    log(f"  Tables: {tables}, Table size: {table_size:,}")
     log(f"  Threads: {threads}, Duration: {duration}s")
-
-    histogram_flag = "--histogram=on" if histogram else ""
+    log(f"  Error handling: ignoring errors {MYSQL_IGNORE_ERRORS}")
     
-    result = ssh_capture(host, f"""
-sysbench {workload} \\
-    --mysql-host=127.0.0.1 \\
-    --mysql-port={port} \\
-    --mysql-user=root \\
-    --mysql-db={database} \\
-    --tables={tables} \\
-    --table-size={table_size} \\
-    --threads={threads} \\
-    --time={duration} \\
-    --report-interval={report_interval} \\
-    {histogram_flag} \\
-    run 2>&1
-""", key_path)
+    # Determine if we should skip transactions (read-only workloads)
+    skip_trx = workload in ("oltp_read_only", "oltp_point_select")
+    if skip_trx:
+        log(f"  Read-only mode: --skip_trx=true")
     
+    cmd = build_sysbench_cmd(
+        workload, tables, table_size, threads, duration,
+        report_interval, port, database, skip_trx
+    )
+    
+    result = ssh_capture(host, cmd, key_path)
     output = result.stdout
     print(output)
     
     return parse_sysbench_output(output, workload)
 
 
-def parse_sysbench_output(output: str, workload: str) -> dict:
-    """Parse sysbench output and extract detailed metrics."""
-    metrics = {
-        "workload": workload,
-        "transactions": {},
-        "queries": {},
-        "latency": {},
-        "throughput": {},
-    }
-    
-    lines = output.split('\n')
-    for i, line in enumerate(lines):
-        line = line.strip()
-        
-        if line.startswith("read:"):
-            try:
-                metrics["queries"]["read"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("write:"):
-            try:
-                metrics["queries"]["write"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("other:"):
-            try:
-                metrics["queries"]["other"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif line.startswith("total:"):
-            try:
-                metrics["queries"]["total"] = int(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        
-        if "transactions:" in line and "per sec" in line:
-            parts = line.split()
-            for j, p in enumerate(parts):
-                if "per" in p and j > 0:
-                    try:
-                        metrics["throughput"]["tps"] = float(parts[j-1].strip('('))
-                        metrics["transactions"]["total"] = int(parts[1])
-                    except (ValueError, IndexError):
-                        pass
-        
-        if "queries:" in line and "per sec" in line:
-            parts = line.split()
-            for j, p in enumerate(parts):
-                if "per" in p and j > 0:
-                    try:
-                        metrics["throughput"]["qps"] = float(parts[j-1].strip('('))
-                    except (ValueError, IndexError):
-                        pass
-        
-        if "min:" in line and "latency" not in line.lower():
-            try:
-                metrics["latency"]["min_ms"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif "avg:" in line:
-            try:
-                metrics["latency"]["avg_ms"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif "max:" in line:
-            try:
-                metrics["latency"]["max_ms"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif "95th percentile:" in line:
-            try:
-                metrics["latency"]["p95_ms"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-        elif "99th percentile:" in line:
-            try:
-                metrics["latency"]["p99_ms"] = float(line.split(":")[1].strip())
-            except (ValueError, IndexError):
-                pass
-    
-    return metrics
-
-
 def print_metrics_summary(metrics: dict):
     """Print a formatted summary of benchmark metrics."""
     log("")
-    log("=" * 60)
+    log("=" * 70)
     log(f"BENCHMARK RESULTS: {metrics.get('workload', 'unknown')}")
-    log("=" * 60)
+    log("=" * 70)
     
     tp = metrics.get("throughput", {})
     if tp:
@@ -461,6 +583,13 @@ def print_metrics_summary(metrics: dict):
         log(f"    P99: {lat.get('p99_ms', 'N/A')}")
         log(f"    Max: {lat.get('max_ms', 'N/A')}")
     
+    # Availability metrics
+    errors = metrics.get("errors", {})
+    avail = metrics.get("availability_pct", 100.0)
+    log(f"  Availability:")
+    log(f"    Success Rate: {avail:.3f}%")
+    log(f"    Ignored Errors: {errors.get('ignored', 0):,} ({errors.get('per_sec', 0):.2f}/sec)")
+    
     queries = metrics.get("queries", {})
     if queries:
         log(f"  Query Breakdown:")
@@ -469,7 +598,7 @@ def print_metrics_summary(metrics: dict):
         log(f"    Other: {queries.get('other', 'N/A'):,}")
         log(f"    Total: {queries.get('total', 'N/A'):,}")
     
-    log("=" * 60)
+    log("=" * 70)
 
 
 def run_adaptive_phase(
@@ -488,15 +617,17 @@ def run_adaptive_phase(
     start_threads = phase["threads"]
     thread_step = phase.get("thread_step", 32)
     max_threads = phase.get("max_threads", 512)
-    decay_threshold = phase.get("decay_threshold", 0.50)  # Stop when QPS drops 50% from peak
-    latency_multiplier = phase.get("latency_multiplier", 10)  # Stop when latency is 10x baseline
+    decay_threshold = phase.get("decay_threshold", 0.50)
+    latency_multiplier = phase.get("latency_multiplier", 10)
     phase_duration = phase.get("duration", 30)
     
     current_threads = start_threads
     iteration = 0
     peak_qps = 0
     peak_threads = start_threads
-    baseline_p95 = None  # First iteration's P95 latency
+    baseline_p95 = None
+    
+    skip_trx = workload in ("oltp_read_only", "oltp_point_select")
     
     log(f"    Adaptive mode: starting at {start_threads} threads, step={thread_step}, max={max_threads}")
     log(f"    Breaking conditions: QPS decay >= {decay_threshold*100:.0f}% OR latency >= {latency_multiplier}x baseline")
@@ -506,20 +637,12 @@ def run_adaptive_phase(
         log(f"")
         log(f"    >> Iteration {iteration}: {current_threads} threads, {phase_duration}s")
         
-        result = ssh_capture(host, f"""
-sysbench {workload} \\
-    --mysql-host=127.0.0.1 \\
-    --mysql-port={port} \\
-    --mysql-user=root \\
-    --mysql-db={database} \\
-    --tables={tables} \\
-    --table-size={table_size} \\
-    --threads={current_threads} \\
-    --time={phase_duration} \\
-    --report-interval={report_interval} \\
-    run 2>&1
-""", key_path)
+        cmd = build_sysbench_cmd(
+            workload, tables, table_size, current_threads, phase_duration,
+            report_interval, port, database, skip_trx
+        )
         
+        result = ssh_capture(host, cmd, key_path)
         output = result.stdout
         print(output)
         
@@ -532,11 +655,14 @@ sysbench {workload} \\
         current_qps = metrics.get("throughput", {}).get("qps", 0)
         lat = metrics.get("latency", {})
         current_p95 = lat.get("p95_ms", 0)
+        current_p99 = lat.get("p99_ms", 0)
+        avail = metrics.get("availability_pct", 100.0)
+        errors = metrics.get("errors", {}).get("ignored", 0)
         
         # Set baseline latency from first iteration
         if baseline_p95 is None and current_p95 > 0:
             baseline_p95 = current_p95
-            log(f"       Baseline P95 latency: {baseline_p95:.1f}ms")
+            log(f"       Baseline P95: {baseline_p95:.1f}ms")
         
         # Track peak QPS
         if current_qps > peak_qps:
@@ -548,7 +674,7 @@ sysbench {workload} \\
         latency_ratio = current_p95 / baseline_p95 if baseline_p95 and baseline_p95 > 0 else 1
         
         log(f"       QPS: {current_qps:,.1f} | Peak: {peak_qps:,.1f} @ {peak_threads} thr | Decay: {decay_from_peak*100:.1f}%")
-        log(f"       P95: {current_p95:.1f}ms | Baseline: {baseline_p95:.1f}ms | Ratio: {latency_ratio:.1f}x")
+        log(f"       P95: {current_p95:.1f}ms P99: {current_p99:.1f}ms | Ratio: {latency_ratio:.1f}x | Avail: {avail:.2f}% (err: {errors})")
         
         # Check breaking conditions
         broken = False
@@ -565,12 +691,11 @@ sysbench {workload} \\
             log(f"")
             log(f"    !! BREAKING POINT REACHED: {break_reason}")
             log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
-            log(f"    !! Final state: {current_qps:,.1f} QPS, {current_p95:.1f}ms P95 @ {current_threads} threads")
+            log(f"    !! Final: {current_qps:,.1f} QPS, P95={current_p95:.1f}ms, P99={current_p99:.1f}ms @ {current_threads} threads")
             break
         
         current_threads += thread_step
         
-        # Brief pause between iterations to let system stabilize
         if current_threads <= max_threads:
             log(f"       Ramping up to {current_threads} threads...")
             time.sleep(3)
@@ -592,6 +717,7 @@ def run_multi_phase_benchmark(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
+    resource_monitor: threading.Thread = None,
 ) -> list:
     """Run multi-phase benchmark (stress or scaling profile)."""
     profile = MULTI_PHASE_PROFILES[profile_name]
@@ -600,15 +726,16 @@ def run_multi_phase_benchmark(
     log(f"MULTI-PHASE BENCHMARK: {profile_name.upper()}")
     log(f"  {profile['description']}")
     
-    # Calculate total duration (may be adaptive)
     total_phases = len(profile['phases'])
     if profile['total_duration'] == "adaptive":
         estimated = sum(p.get('duration', 30) for p in profile['phases'])
         log(f"  Phases: {total_phases} (adaptive duration, min ~{estimated}s)")
     else:
         log(f"  Total duration: {profile['total_duration']}s ({total_phases} phases)")
+    log(f"  Error handling: ignoring {MYSQL_IGNORE_ERRORS}")
     log("=" * 70)
     
+    skip_trx = workload in ("oltp_read_only", "oltp_point_select")
     all_results = []
     
     for i, phase in enumerate(profile["phases"]):
@@ -620,13 +747,12 @@ def run_multi_phase_benchmark(
         log("")
         log(f">>> PHASE {i+1}/{len(profile['phases'])}: {phase_name.upper()}")
         if is_adaptive:
-            log(f"    Mode: ADAPTIVE (start={threads} threads, step={phase.get('thread_step', 32)}, max={phase.get('max_threads', 512)})")
+            log(f"    Mode: ADAPTIVE (start={threads}, step={phase.get('thread_step', 32)}, max={phase.get('max_threads', 512)})")
         else:
             log(f"    Threads: {threads}, Duration: {duration}s")
         log("-" * 50)
         
         if is_adaptive:
-            # Run adaptive overload phase
             phase_results = run_adaptive_phase(
                 host, key_path, phase, workload,
                 tables, table_size, report_interval,
@@ -634,21 +760,12 @@ def run_multi_phase_benchmark(
             )
             all_results.extend(phase_results)
         else:
-            # Run standard fixed-duration phase
-            result = ssh_capture(host, f"""
-sysbench {workload} \\
-    --mysql-host=127.0.0.1 \\
-    --mysql-port={port} \\
-    --mysql-user=root \\
-    --mysql-db={database} \\
-    --tables={tables} \\
-    --table-size={table_size} \\
-    --threads={threads} \\
-    --time={duration} \\
-    --report-interval={report_interval} \\
-    run 2>&1
-""", key_path)
+            cmd = build_sysbench_cmd(
+                workload, tables, table_size, threads, duration,
+                report_interval, port, database, skip_trx
+            )
             
+            result = ssh_capture(host, cmd, key_path)
             output = result.stdout
             print(output)
             
@@ -660,7 +777,8 @@ sysbench {workload} \\
             
             tp = metrics.get("throughput", {})
             lat = metrics.get("latency", {})
-            log(f"    Phase Result: TPS={tp.get('tps', 0):,.1f} QPS={tp.get('qps', 0):,.1f} P95={lat.get('p95_ms', 'N/A')}ms")
+            avail = metrics.get("availability_pct", 100.0)
+            log(f"    Result: TPS={tp.get('tps', 0):,.1f} QPS={tp.get('qps', 0):,.1f} P95={lat.get('p95_ms', 'N/A')}ms P99={lat.get('p99_ms', 'N/A')}ms Avail={avail:.2f}%")
     
     return all_results
 
@@ -668,11 +786,14 @@ sysbench {workload} \\
 def print_multi_phase_summary(profile_name: str, results: list):
     """Print summary of multi-phase benchmark results."""
     log("")
-    log("=" * 80)
-    log(f"MULTI-PHASE SUMMARY: {profile_name.upper()}")
-    log("=" * 80)
-    log(f"{'Phase':<15} {'Threads':>8} {'Duration':>10} {'TPS':>12} {'QPS':>12} {'P95(ms)':>10} {'P99(ms)':>10}")
-    log("-" * 80)
+    log("=" * 100)
+    log(f"BENCHMARK SUMMARY: {profile_name.upper()}")
+    log("=" * 100)
+    log(f"{'Phase':<18} {'Thr':>5} {'Dur':>5} {'TPS':>10} {'QPS':>10} {'P95':>8} {'P99':>8} {'Avail':>8} {'Errors':>7}")
+    log("-" * 100)
+    
+    total_errors = 0
+    total_txns = 0
     
     for r in results:
         phase = r.get("phase", "unknown")
@@ -682,25 +803,34 @@ def print_multi_phase_summary(profile_name: str, results: list):
         lat = r.get("latency", {})
         tps = tp.get("tps", 0)
         qps = tp.get("qps", 0)
-        p95 = lat.get("p95_ms", "N/A")
-        p99 = lat.get("p99_ms", "N/A")
+        p95 = lat.get("p95_ms", 0)
+        p99 = lat.get("p99_ms", 0)
+        avail = r.get("availability_pct", 100.0)
+        errors = r.get("errors", {}).get("ignored", 0)
         
-        p95_str = f"{p95:.2f}" if isinstance(p95, (int, float)) else str(p95)
-        p99_str = f"{p99:.2f}" if isinstance(p99, (int, float)) else str(p99)
+        total_errors += errors
+        total_txns += r.get("transactions", {}).get("total", 0)
         
-        log(f"{phase:<15} {threads:>8} {duration:>8}s {tps:>12,.1f} {qps:>12,.1f} {p95_str:>10} {p99_str:>10}")
+        p95_str = f"{p95:.1f}" if isinstance(p95, (int, float)) and p95 > 0 else "N/A"
+        p99_str = f"{p99:.1f}" if isinstance(p99, (int, float)) and p99 > 0 else "N/A"
+        
+        log(f"{phase:<18} {threads:>5} {duration:>4}s {tps:>10,.1f} {qps:>10,.1f} {p95_str:>8} {p99_str:>8} {avail:>7.2f}% {errors:>7}")
     
-    log("-" * 80)
+    log("-" * 100)
     
-    total_tps = sum(r.get("throughput", {}).get("tps", 0) * r.get("duration", 0) for r in results)
+    # Aggregates
     total_duration = sum(r.get("duration", 0) for r in results)
-    avg_tps = total_tps / total_duration if total_duration > 0 else 0
+    total_tps_weighted = sum(r.get("throughput", {}).get("tps", 0) * r.get("duration", 0) for r in results)
+    avg_tps = total_tps_weighted / total_duration if total_duration > 0 else 0
     
-    peak_tps = max(r.get("throughput", {}).get("tps", 0) for r in results)
+    peak_tps = max((r.get("throughput", {}).get("tps", 0) for r in results), default=0)
     peak_phase = next((r["phase"] for r in results if r.get("throughput", {}).get("tps", 0) == peak_tps), "N/A")
     
-    log(f"Average TPS: {avg_tps:,.1f} | Peak TPS: {peak_tps:,.1f} (phase: {peak_phase})")
-    log("=" * 80)
+    overall_avail = (total_txns / (total_txns + total_errors)) * 100 if (total_txns + total_errors) > 0 else 100.0
+    
+    log(f"Duration: {total_duration}s | Avg TPS: {avg_tps:,.1f} | Peak TPS: {peak_tps:,.1f} ({peak_phase})")
+    log(f"Overall Availability: {overall_avail:.3f}% | Total Errors: {total_errors:,}")
+    log("=" * 100)
 
 
 def run_sysbench_cleanup(
@@ -721,6 +851,26 @@ sysbench oltp_read_write \\
     --tables={tables} \\
     cleanup
 """, key_path, strict=False)
+
+
+def fetch_final_resource_snapshot(host: str, key_path: Path):
+    """Fetch final resource utilization snapshot."""
+    log("")
+    log("=" * 70)
+    log("FINAL RESOURCE UTILIZATION")
+    log("=" * 70)
+    
+    script = """
+echo "--- Client VM ---"
+echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{printf "%.1f%% user, %.1f%% sys, %.1f%% idle", $2, $4, $8}')"
+echo "Memory: $(free -h | awk 'NR==2{printf "%s used / %s total (%.1f%%)", $3, $2, $3*100/$2}')"
+echo "Load: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
+echo ""
+echo "--- TiDB Pods ---"
+kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "%-22s CPU: %-8s Mem: %s\\n", $1, $2, $3}' || echo "N/A"
+"""
+    ssh_run(host, script, key_path, strict=False)
+    log("=" * 70)
 
 
 def parse_args():
@@ -808,7 +958,7 @@ def parse_args():
         "--profile",
         choices=list(WORKLOAD_PROFILES.keys()),
         default="heavy",
-        help="Workload profile: quick(30s), light(60s), medium(2m), heavy(5m, default), stress(4m multi-phase), scaling(4m multi-phase)",
+        help="Workload profile: quick(30s), light(60s), medium(2m), heavy(5m, default), stress, scaling",
     )
 
     # Actions
@@ -833,26 +983,9 @@ def parse_args():
         help="Only clean up tables",
     )
     parser.add_argument(
-        "--capture-metrics",
+        "--no-resource-monitor",
         action="store_true",
-        default=True,
-        help="Capture system metrics (CPU, IOPS, memory) during benchmark. Default: enabled.",
-    )
-    parser.add_argument(
-        "--no-metrics",
-        action="store_true",
-        help="Disable system metrics capture.",
-    )
-    parser.add_argument(
-        "--show-tidb-metrics",
-        action="store_true",
-        default=True,
-        help="Show TiDB cluster metrics (regions, leaders) after benchmark. Default: enabled.",
-    )
-    parser.add_argument(
-        "--no-tidb-metrics",
-        action="store_true",
-        help="Disable TiDB cluster metrics display.",
+        help="Disable per-minute resource monitoring during benchmark",
     )
 
     return parser.parse_args()
@@ -895,6 +1028,9 @@ def main():
     else:
         multi_phase = None
 
+    # Print cluster summary
+    print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
+
     if not args.skip_prepare:
         run_sysbench_prepare(
             host, key_path,
@@ -906,60 +1042,40 @@ def main():
         log("Tables prepared. Skipping benchmark (--prepare-only).")
         return
 
-    metrics_thread = None
-    capture_metrics = args.capture_metrics and not args.no_metrics
-    show_tidb_metrics = args.show_tidb_metrics and not args.no_tidb_metrics
-    
-    # Calculate total_duration for metrics capture (handle adaptive case)
-    if multi_phase:
-        mp_profile = MULTI_PHASE_PROFILES[multi_phase]
-        if mp_profile["total_duration"] == "adaptive":
-            # Estimate duration: sum of fixed phases + max adaptive iterations
-            estimated = sum(p.get('duration', 30) for p in mp_profile['phases'])
-            # Add buffer for potential adaptive iterations (up to 10 iterations)
-            adaptive_phases = [p for p in mp_profile['phases'] if p.get('adaptive')]
-            for ap in adaptive_phases:
-                max_iters = (ap.get('max_threads', 512) - ap['threads']) // ap.get('thread_step', 32) + 1
-                estimated += max_iters * ap.get('duration', 30)
-            total_duration = estimated
+    # Start resource monitoring (every 60 seconds)
+    resource_monitor = None
+    if not args.no_resource_monitor:
+        log("Starting per-minute resource monitoring...")
+        resource_monitor = start_resource_monitor(host, key_path, interval=60)
+
+    try:
+        if multi_phase:
+            phase_results = run_multi_phase_benchmark(
+                host, key_path,
+                multi_phase,
+                args.workload,
+                tables, table_size,
+                args.report_interval,
+                args.port,
+                resource_monitor=resource_monitor,
+            )
+            print_multi_phase_summary(multi_phase, phase_results)
         else:
-            total_duration = mp_profile["total_duration"]
-    else:
-        total_duration = duration
-    
-    if capture_metrics:
-        log("Starting background metrics capture (CPU, IOPS, memory)...")
-        metrics_thread = start_metrics_capture(
-            host, key_path, total_duration + 120  # Extra buffer for adaptive
-        )
+            benchmark_metrics = run_sysbench_benchmark(
+                host, key_path,
+                args.workload,
+                tables, table_size,
+                threads, duration, args.report_interval,
+                args.port,
+            )
+            print_metrics_summary(benchmark_metrics)
+    finally:
+        # Stop resource monitor
+        if resource_monitor:
+            stop_resource_monitor(resource_monitor)
 
-    if multi_phase:
-        phase_results = run_multi_phase_benchmark(
-            host, key_path,
-            multi_phase,
-            args.workload,
-            tables, table_size,
-            args.report_interval,
-            args.port,
-        )
-        print_multi_phase_summary(multi_phase, phase_results)
-    else:
-        benchmark_metrics = run_sysbench_benchmark(
-            host, key_path,
-            args.workload,
-            tables, table_size,
-            threads, duration, args.report_interval,
-            args.port,
-        )
-        print_metrics_summary(benchmark_metrics)
-
-    if capture_metrics:
-        log("Waiting for metrics capture to complete...")
-        time.sleep(5)
-        fetch_metrics_summary(host, key_path)
-
-    if show_tidb_metrics:
-        fetch_tidb_cluster_metrics(host, key_path, args.port)
+    # Final resource snapshot
+    fetch_final_resource_snapshot(host, key_path)
 
     if args.cleanup:
         run_sysbench_cleanup(host, key_path, args.tables, args.port)
