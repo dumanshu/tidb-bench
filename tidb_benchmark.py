@@ -45,16 +45,171 @@ SESSION_VARS_READ_ONLY = (
 # 1213: Deadlock, 1020: Record changed, 1205: Lock wait timeout, 1105: Deadline exceeded
 MYSQL_IGNORE_ERRORS = "1213,1020,1205,1105"
 
-# AWS cost estimates (us-east-1, on-demand)
+# AWS cost estimates (us-east-1, on-demand pricing as of 2024)
+# Sources: https://aws.amazon.com/ec2/pricing/on-demand/
 AWS_COSTS = {
-    "c7g.2xlarge": {"hourly": 0.29, "vcpu": 8, "memory_gb": 16},
-    "c7g.xlarge": {"hourly": 0.145, "vcpu": 4, "memory_gb": 8},
-    "c7g.4xlarge": {"hourly": 0.58, "vcpu": 16, "memory_gb": 32},
-    "m7g.2xlarge": {"hourly": 0.326, "vcpu": 8, "memory_gb": 32},
-    "m7g.4xlarge": {"hourly": 0.652, "vcpu": 16, "memory_gb": 64},
-    "ebs_gp3_gb_month": 0.08,
-    "cross_az_gb": 0.01,
+    # EC2 instances (hourly rates)
+    "ec2": {
+        "c7g.xlarge": {"hourly": 0.145, "vcpu": 4, "memory_gb": 8},
+        "c7g.2xlarge": {"hourly": 0.29, "vcpu": 8, "memory_gb": 16},
+        "c7g.4xlarge": {"hourly": 0.58, "vcpu": 16, "memory_gb": 32},
+        "c7g.8xlarge": {"hourly": 1.16, "vcpu": 32, "memory_gb": 64},
+        "m7g.xlarge": {"hourly": 0.163, "vcpu": 4, "memory_gb": 16},
+        "m7g.2xlarge": {"hourly": 0.326, "vcpu": 8, "memory_gb": 32},
+        "m7g.4xlarge": {"hourly": 0.652, "vcpu": 16, "memory_gb": 64},
+        "r7g.2xlarge": {"hourly": 0.428, "vcpu": 8, "memory_gb": 64},
+        "r7g.4xlarge": {"hourly": 0.856, "vcpu": 16, "memory_gb": 128},
+    },
+    # EBS storage
+    "ebs": {
+        "gp3_per_gb_month": 0.08,
+        "gp3_iops_over_3000": 0.005,  # per IOPS/month over 3000 baseline
+        "gp3_throughput_over_125": 0.04,  # per MB/s/month over 125 baseline
+        "io2_per_gb_month": 0.125,
+        "io2_per_iops_month": 0.065,
+    },
+    # Network transfer (per GB)
+    "network": {
+        "cross_az_per_gb": 0.01,  # $0.01/GB each direction
+        "same_az_per_gb": 0.00,  # Free within same AZ
+        "internet_out_first_10tb": 0.09,
+        "internet_out_next_40tb": 0.085,
+        "nat_gateway_per_gb": 0.045,
+    },
+    # S3 (if used for backups)
+    "s3": {
+        "standard_per_gb_month": 0.023,
+        "put_per_1000": 0.005,
+        "get_per_1000": 0.0004,
+    },
 }
+
+
+class CostTracker:
+    """Track and accumulate costs during benchmark run."""
+    
+    def __init__(self, region: str = "us-east-1"):
+        self.region = region
+        self.start_time = time.time()
+        self.costs = {
+            "client": {"compute": 0.0, "storage": 0.0, "network": 0.0},
+            "server": {"compute": 0.0, "storage": 0.0, "network": 0.0},
+        }
+        self.metrics = {
+            "total_queries": 0,
+            "total_bytes_transferred": 0,
+            "client_instance_type": None,
+            "server_instance_type": None,
+            "server_instance_count": 0,
+            "ebs_gb": 0,
+        }
+    
+    def set_infrastructure(self, client_type: str, server_type: str, 
+                           server_count: int, ebs_gb: int = 600):
+        """Set infrastructure details for cost calculation."""
+        self.metrics["client_instance_type"] = client_type
+        self.metrics["server_instance_type"] = server_type
+        self.metrics["server_instance_count"] = server_count
+        self.metrics["ebs_gb"] = ebs_gb
+    
+    def add_queries(self, query_count: int, avg_row_size_bytes: int = 200):
+        """Track query volume for network cost estimation."""
+        self.metrics["total_queries"] += query_count
+        # Estimate bytes: queries * avg response size
+        # Read queries return ~avg_row_size, writes send ~avg_row_size
+        self.metrics["total_bytes_transferred"] += query_count * avg_row_size_bytes
+    
+    def calculate_costs(self, duration_seconds: float) -> dict:
+        """Calculate all costs for the given duration."""
+        hours = duration_seconds / 3600
+        
+        # Client compute cost
+        client_type = self.metrics.get("client_instance_type", "c7g.2xlarge")
+        client_hourly = AWS_COSTS["ec2"].get(client_type, {}).get("hourly", 0.29)
+        self.costs["client"]["compute"] = client_hourly * hours
+        
+        # Server compute cost (all TiDB pods run on single host in kind setup)
+        server_type = self.metrics.get("server_instance_type", "c7g.2xlarge")
+        server_hourly = AWS_COSTS["ec2"].get(server_type, {}).get("hourly", 0.29)
+        # In kind setup, all pods share one EC2 instance
+        self.costs["server"]["compute"] = server_hourly * hours
+        
+        # EBS storage cost (prorated for duration)
+        ebs_gb = self.metrics.get("ebs_gb", 600)
+        monthly_ebs = ebs_gb * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+        self.costs["server"]["storage"] = monthly_ebs * (hours / 720)  # 720 hours/month
+        
+        # Network cost estimation
+        # In kind setup, all traffic is localhost (free)
+        # Cross-AZ traffic would be for external clients
+        bytes_gb = self.metrics.get("total_bytes_transferred", 0) / (1024**3)
+        # Assume 50% of traffic would be cross-AZ in real deployment
+        cross_az_gb = bytes_gb * 0.5
+        self.costs["server"]["network"] = cross_az_gb * AWS_COSTS["network"]["cross_az_per_gb"] * 2  # bidirectional
+        
+        return self.costs
+    
+    def get_summary(self, duration_seconds: float) -> dict:
+        """Get cost summary with totals."""
+        self.calculate_costs(duration_seconds)
+        
+        client_total = sum(self.costs["client"].values())
+        server_total = sum(self.costs["server"].values())
+        
+        return {
+            "duration_seconds": duration_seconds,
+            "duration_hours": duration_seconds / 3600,
+            "client": {
+                **self.costs["client"],
+                "total": client_total,
+            },
+            "server": {
+                **self.costs["server"],
+                "total": server_total,
+            },
+            "grand_total": client_total + server_total,
+            "hourly_rate": (client_total + server_total) / (duration_seconds / 3600) if duration_seconds > 0 else 0,
+            "metrics": self.metrics,
+        }
+    
+    def print_summary(self, duration_seconds: float):
+        """Print formatted cost summary."""
+        summary = self.get_summary(duration_seconds)
+        hours = summary["duration_hours"]
+        
+        log("")
+        log("=" * 70)
+        log("COST SUMMARY")
+        log("=" * 70)
+        log(f"Duration: {duration_seconds:.0f}s ({hours:.3f} hours)")
+        log("")
+        log(f"{'Category':<20} {'Compute':>12} {'Storage':>12} {'Network':>12} {'Total':>12}")
+        log("-" * 70)
+        
+        # Client costs
+        c = summary["client"]
+        log(f"{'Client (EC2)':<20} ${c['compute']:>11.4f} ${c['storage']:>11.4f} ${c['network']:>11.4f} ${c['total']:>11.4f}")
+        
+        # Server costs
+        s = summary["server"]
+        log(f"{'Server (EC2+EBS)':<20} ${s['compute']:>11.4f} ${s['storage']:>11.4f} ${s['network']:>11.4f} ${s['total']:>11.4f}")
+        
+        log("-" * 70)
+        log(f"{'TOTAL':<20} ${c['compute']+s['compute']:>11.4f} ${c['storage']+s['storage']:>11.4f} ${c['network']+s['network']:>11.4f} ${summary['grand_total']:>11.4f}")
+        log("")
+        log(f"Effective hourly rate: ${summary['hourly_rate']:.2f}/hr")
+        
+        # Extrapolations
+        log("")
+        log("--- Cost Projections ---")
+        log(f"Per hour:  ${summary['hourly_rate']:.2f}")
+        log(f"Per day:   ${summary['hourly_rate'] * 24:.2f}")
+        log(f"Per month: ${summary['hourly_rate'] * 720:.2f}")
+        log("")
+        log("Note: Costs are estimates based on us-east-1 on-demand pricing.")
+        log("      Network costs assume 50% cross-AZ traffic in production.")
+        log("      Actual costs may vary based on reserved instances, savings plans.")
+        log("=" * 70)
 
 WORKLOAD_PROFILES = {
     "quick": {"tables": 4, "table_size": 10000, "threads": 16, "duration": 30},
@@ -239,7 +394,7 @@ kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | head -10 || echo "ku
 
 
 def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, seed: str, port: int = DEFAULT_PORT):
-    """Print cluster configuration summary with cost estimates."""
+    """Print cluster configuration summary."""
     log("")
     log("=" * 70)
     log("CLUSTER CONFIGURATION")
@@ -259,34 +414,39 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     # Determine instance type (assuming kind single-node setup uses host instance)
     host_type = "c7g.2xlarge"  # Default
     for inst in inst_info.get("instances", []):
-        if inst.get("role") == "host":
-            host_type = inst.get("type", "c7g.2xlarge")
+        inst_type = inst.get("type")
+        if inst_type:
+            host_type = inst_type
             break
     
-    host_specs = AWS_COSTS.get(host_type, {"vcpu": 8, "memory_gb": 16})
+    host_specs = AWS_COSTS["ec2"].get(host_type, {"vcpu": 8, "memory_gb": 16})
     
-    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
-    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
-    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
-    log(f"{'Host':<12} {'1':>6} {host_type:>14} {host_specs['vcpu']:>6} {host_specs['memory_gb']:>6}GB")
+    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
+    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
+    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
+    log(f"{'Host (EC2)':<12} {'1':>6} {host_type:>14} {host_specs.get('vcpu', 8):>6} {host_specs.get('memory_gb', 16):>6}GB")
     
-    # Cost estimate
+    # Quick cost preview (detailed costs shown after benchmark)
     log("")
-    log("--- Cost Estimate (us-east-1, on-demand, excl. client) ---")
-    hourly = AWS_COSTS.get(host_type, {}).get("hourly", 0.29)
-    daily = hourly * 24
-    log(f"EC2 Host: ${hourly:.2f}/hr (${daily:.2f}/day)")
-    log(f"EBS (est. 600GB gp3): ~${600 * 0.08 / 30:.2f}/day")
-    log(f"Total: ~${daily + 1.60:.2f}/day")
+    hourly = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.29)
+    log(f"EC2 Rate: ${hourly:.3f}/hr | Detailed costs shown after benchmark")
     log("=" * 70)
 
 
-def start_resource_monitor(host: str, key_path: Path, interval: int = 60) -> threading.Thread:
+def start_resource_monitor(host: str, key_path: Path, interval: int = 60, 
+                          cost_tracker: Optional['CostTracker'] = None,
+                          start_time: Optional[float] = None) -> threading.Thread:
     """Start background thread that logs resource utilization every interval."""
     stop_event = threading.Event()
+    _start_time = start_time or time.time()
     
     def monitor_resources():
+        iteration = 0
         while not stop_event.is_set():
+            iteration += 1
+            elapsed = time.time() - _start_time
+            elapsed_min = elapsed / 60
+            
             script = """
 # Compact resource summary
 echo "--- $(date +%H:%M:%S) Resource Snapshot ---"
@@ -300,12 +460,18 @@ echo "Client: CPU=${CPU}% Mem=${MEM} Conn=${CONN}"
 # Pod utilization (compact)
 echo "Pods:"
 kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "  %-20s CPU:%-6s Mem:%s\\n", $1, $2, $3}' | head -8 || echo "  N/A"
-echo ""
 """
             result = ssh_capture(host, script, key_path)
             if result.stdout.strip():
                 for line in result.stdout.strip().split('\n'):
                     log(line)
+            
+            # Show cost accrual if tracker provided
+            if cost_tracker:
+                summary = cost_tracker.get_summary(elapsed)
+                log(f"  Cost so far: ${summary['grand_total']:.4f} ({elapsed_min:.1f} min elapsed)")
+            
+            log("")
             stop_event.wait(interval)
     
     thread = threading.Thread(target=monitor_resources, daemon=True)
@@ -1028,8 +1194,36 @@ def main():
     else:
         multi_phase = None
 
-    # Print cluster summary
+    # Print cluster summary and get instance info for cost tracking
     print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
+    
+    # Initialize cost tracker
+    cost_tracker = CostTracker(region=args.region)
+    inst_info = get_instance_info(args.region, args.aws_profile, args.seed)
+    
+    # Determine instance types
+    client_type = "c7g.2xlarge"  # Default
+    server_type = "c7g.2xlarge"  # Default (kind cluster runs on same host)
+    for inst in inst_info.get("instances", []):
+        if inst.get("type"):
+            client_type = inst.get("type")
+            server_type = inst.get("type")  # Same host for kind setup
+            break
+    
+    # Get cluster info for pod count
+    cluster_info = get_cluster_info(host, key_path, args.port)
+    server_count = (cluster_info.get("tidb_count", 2) + 
+                    cluster_info.get("tikv_count", 3) + 
+                    cluster_info.get("pd_count", 3))
+    
+    cost_tracker.set_infrastructure(
+        client_type=client_type,
+        server_type=server_type,
+        server_count=server_count,
+        ebs_gb=600,  # Default EBS size
+    )
+    
+    benchmark_start_time = time.time()
 
     if not args.skip_prepare:
         run_sysbench_prepare(
@@ -1045,9 +1239,14 @@ def main():
     # Start resource monitoring (every 60 seconds)
     resource_monitor = None
     if not args.no_resource_monitor:
-        log("Starting per-minute resource monitoring...")
-        resource_monitor = start_resource_monitor(host, key_path, interval=60)
+        log("Starting per-minute resource monitoring with cost tracking...")
+        resource_monitor = start_resource_monitor(
+            host, key_path, interval=60,
+            cost_tracker=cost_tracker,
+            start_time=benchmark_start_time,
+        )
 
+    total_queries = 0
     try:
         if multi_phase:
             phase_results = run_multi_phase_benchmark(
@@ -1060,6 +1259,9 @@ def main():
                 resource_monitor=resource_monitor,
             )
             print_multi_phase_summary(multi_phase, phase_results)
+            # Sum up queries from all phases
+            for r in phase_results:
+                total_queries += r.get("queries", {}).get("total", 0)
         else:
             benchmark_metrics = run_sysbench_benchmark(
                 host, key_path,
@@ -1069,19 +1271,29 @@ def main():
                 args.port,
             )
             print_metrics_summary(benchmark_metrics)
+            total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
     finally:
         # Stop resource monitor
         if resource_monitor:
             stop_resource_monitor(resource_monitor)
 
+    # Calculate benchmark duration
+    benchmark_end_time = time.time()
+    actual_duration = benchmark_end_time - benchmark_start_time
+
+    # Track queries for network cost estimation
+    cost_tracker.add_queries(total_queries, avg_row_size_bytes=200)
+
     # Final resource snapshot
     fetch_final_resource_snapshot(host, key_path)
+    
+    # Print cost summary
+    cost_tracker.print_summary(actual_duration)
 
     if args.cleanup:
         run_sysbench_cleanup(host, key_path, args.tables, args.port)
 
     log("Benchmark complete.")
-
 
 if __name__ == "__main__":
     main()
