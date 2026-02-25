@@ -635,11 +635,9 @@ ORDER BY TYPE, INSTANCE;
     return result.stdout.strip()
 
 
-def format_minute_report(minute: int, intervals: list, resource_text: str,
-                         cost_tracker=None, start_time: float = 0) -> str:
+def format_minute_report(minute: int, intervals: list, resource_text: str) -> str:
     """Format a per-minute summary combining performance + resources."""
     lines = []
-    elapsed = time.time() - start_time if start_time else minute * 60
 
     # Aggregate interval data for this minute
     if intervals:
@@ -678,11 +676,6 @@ def format_minute_report(minute: int, intervals: list, resource_text: str,
         res_str += f"  Nodes=[{', '.join(node_lines)}]"
     lines.append(res_str)
 
-    # Cost
-    if cost_tracker:
-        summary = cost_tracker.get_summary(elapsed)
-        lines.append(f"  Cost:  ${summary['grand_total']:.4f} so far ({elapsed/60:.1f} min)")
-
     return '\n'.join(lines)
 
 
@@ -719,14 +712,12 @@ def run_sysbench_streaming(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
-    cost_tracker=None,
-    benchmark_start_time: float = 0,
 ) -> dict:
     """Run sysbench with streaming output and per-minute reporting.
 
     Streams sysbench output line-by-line, parses interval lines,
-    and prints a consolidated per-minute report with performance,
-    resource utilization, and cost data.
+    and prints a consolidated per-minute report with performance
+    and resource utilization.
     """
     skip_trx = workload in ("oltp_read_only", "oltp_point_select")
     cmd = build_sysbench_cmd(
@@ -757,8 +748,7 @@ def run_sysbench_streaming(
                 if current_minute > 0 and minute_intervals:
                     resource_text = fetch_resource_snapshot_compact(host, key_path)
                     report = format_minute_report(
-                        current_minute, minute_intervals, resource_text,
-                        cost_tracker, benchmark_start_time
+                        current_minute, minute_intervals, resource_text
                     )
                     log(report)
                     log("")
@@ -777,8 +767,7 @@ def run_sysbench_streaming(
     if minute_intervals:
         resource_text = fetch_resource_snapshot_compact(host, key_path)
         report = format_minute_report(
-            current_minute, minute_intervals, resource_text,
-            cost_tracker, benchmark_start_time
+            current_minute, minute_intervals, resource_text
         )
         log(report)
         log("")
@@ -970,8 +959,6 @@ def run_sysbench_benchmark(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
-    cost_tracker=None,
-    benchmark_start_time: float = 0,
 ) -> dict:
     """Run sysbench benchmark with per-minute reporting and return parsed metrics."""
     log(f"Running sysbench {workload} benchmark")
@@ -986,7 +973,6 @@ def run_sysbench_benchmark(
     return run_sysbench_streaming(
         host, key_path, workload, tables, table_size,
         threads, duration, report_interval, port, database,
-        cost_tracker, benchmark_start_time,
     )
 
 
@@ -1244,9 +1230,6 @@ def run_multi_phase_benchmark(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
-    resource_monitor: threading.Thread = None,
-    cost_tracker=None,
-    benchmark_start_time: float = 0,
 ) -> list:
     """Run multi-phase benchmark (stress or scaling profile)."""
     profile = MULTI_PHASE_PROFILES[profile_name]
@@ -1292,7 +1275,6 @@ def run_multi_phase_benchmark(
             metrics = run_sysbench_streaming(
                 host, key_path, workload, tables, table_size,
                 threads, duration, report_interval, port, database,
-                cost_tracker, benchmark_start_time,
             )
             metrics["phase"] = phase_name
             metrics["threads"] = threads
@@ -1643,13 +1625,20 @@ def _run_benchmark(args):
         profile_name=args.profile,
     )
 
-    # Per-minute reporting is now built into the streaming benchmark runner.
-    # No separate resource monitor thread needed.
+    # Print static monthly server hardware cost (excluding client and network)
+    server_specs = AWS_COSTS["ec2"].get(server_type, {})
+    server_hourly = server_specs.get("hourly", 0.29)
+    ebs_monthly = 600 * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    server_compute_monthly = server_hourly * 730  # 1 host for kind setup
+    server_total_monthly = server_compute_monthly + ebs_monthly
+    log("")
+    log(f"Server Monthly Cost (excl. client & network): EC2=${server_compute_monthly:.0f} + EBS=${ebs_monthly:.0f} = ${server_total_monthly:.0f}/mo")
+    log("")
+
     total_queries = 0
     total_transactions = 0
     avg_qps = 0
     avg_tps = 0
-
     if multi_phase:
         phase_results = run_multi_phase_benchmark(
             host, key_path,
