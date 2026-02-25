@@ -139,19 +139,21 @@ class CostTracker:
         client_hourly = AWS_COSTS["ec2"].get(client_type, {}).get("hourly", 0.29)
         self.costs["client"]["compute"] = client_hourly * hours
         
-        # Server compute cost (all TiDB pods run on single host in kind setup)
+        # Server compute cost (each pod on its own dedicated host)
         server_type = self.metrics.get("server_instance_type", "c7g.2xlarge")
         server_hourly = AWS_COSTS["ec2"].get(server_type, {}).get("hourly", 0.29)
-        # In kind setup, all pods share one EC2 instance
-        self.costs["server"]["compute"] = server_hourly * hours
+        # Each TiKV/TiDB/PD pod runs on its own dedicated host
+        server_count = self.metrics.get("server_instance_count", 1)
+        self.costs["server"]["compute"] = server_hourly * hours * server_count
         
-        # EBS storage cost (prorated for duration)
+        # Each TiKV node has its own EBS volume; count TiKV nodes
         ebs_gb = self.metrics.get("ebs_gb", 600)
-        monthly_ebs = ebs_gb * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+        tikv_nodes = max(1, self.metrics.get("server_instance_count", 1))
+        monthly_ebs = ebs_gb * tikv_nodes * AWS_COSTS["ebs"]["gp3_per_gb_month"]
         self.costs["server"]["storage"] = monthly_ebs * (hours / 720)  # 720 hours/month
         
         # Network cost estimation
-        # In kind setup, all traffic is localhost (free)
+        # Cross-AZ traffic between TiDB/TiKV/PD nodes
         # Cross-AZ traffic would be for external clients
         bytes_gb = self.metrics.get("total_bytes_transferred", 0) / (1024**3)
         # Assume 50% of traffic would be cross-AZ in real deployment
@@ -476,10 +478,13 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
     log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
     log(f"{'Client (EC2)':<12} {'1':>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
+    server_count = (cluster_info.get('tidb_count', 2) +
+                    cluster_info.get('tikv_count', 3) +
+                    cluster_info.get('pd_count', 3))
+    log(f"  Total server hosts: {server_count} (each pod on its own dedicated host)")
     log("")
     
-    # EBS storage details
-    # In kind setup, all pods share the host's EBS volume
+    # EBS storage details (per TiKV node — each node has its own EBS volume)
     ebs_type = "gp3"
     ebs_size_gb = 600  # Default root volume size
     ebs_iops = 3000    # gp3 baseline IOPS
@@ -488,11 +493,11 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log("--- Storage Resources ---")
     log(f"{'Volume':<12} {'Type':>8} {'Size':>10} {'IOPS':>8} {'Throughput':>12}")
     log("-" * 56)
-    log(f"{'Root EBS':<12} {ebs_type:>8} {ebs_size_gb:>8}GB {ebs_iops:>8} {ebs_throughput:>9}MB/s")
+    log(f"{'Per-node EBS':<12} {ebs_type:>8} {ebs_size_gb:>8}GB {ebs_iops:>8} {ebs_throughput:>9}MB/s")
     
     # Calculate EBS costs
-    ebs_monthly = ebs_size_gb * AWS_COSTS["ebs"]["gp3_per_gb_month"]
-    log(f"{'':>12} EBS Cost: ${ebs_monthly:.2f}/month (${ebs_monthly/730:.4f}/hr)")
+    ebs_monthly = ebs_size_gb * cluster_info.get('tikv_count', 3) * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    log(f"{'':>12} EBS Cost: ${ebs_monthly:.2f}/month total ({cluster_info.get('tikv_count', 3)} nodes, ${ebs_monthly/730:.4f}/hr)")
     log("")
     
     # Network info
@@ -502,10 +507,10 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log("")
     
     # Quick cost preview
-    hourly_compute = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.58)
+    hourly_compute = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.58) * server_count
     hourly_storage = ebs_monthly / 730
     total_hourly = hourly_compute + hourly_storage
-    log(f"--- Hourly Rate Preview ---")
+    log(f"--- Hourly Rate Preview ({server_count} server hosts + 1 client) ---")
     log(f"EC2 Compute: ${hourly_compute:.3f}/hr | EBS Storage: ${hourly_storage:.4f}/hr | Total: ${total_hourly:.3f}/hr")
     log("=" * 80)
 
@@ -725,16 +730,19 @@ def calculate_bulk_load_params(
     ebs_total_gb: int,
     current_disk_used_gb: float,
     num_tables: int,
-    tikv_replica_count: int = 3,
 ) -> dict:
     """Calculate how many rows per table to load to reach target disk utilization.
 
+    Each TiKV pod runs on its own dedicated host with its own EBS volume.
+    With replication factor 3 across 3 TiKV nodes, every region is stored
+    on every node, so each node's disk grows by roughly the full dataset
+    size.  We target disk fill on a single TiKV node's EBS.
+
     Args:
         target_disk_pct: Target disk utilization percentage (e.g. 30)
-        ebs_total_gb: Total EBS volume size in GB
+        ebs_total_gb: Per-node EBS volume size in GB
         current_disk_used_gb: Current disk usage in GB (OS + existing data)
         num_tables: Number of sysbench tables to create
-        tikv_replica_count: Number of TiKV replicas (default 3)
 
     Returns:
         dict with target_data_gb, rows_per_table, estimated_total_gb
@@ -742,24 +750,20 @@ def calculate_bulk_load_params(
     target_total_gb = ebs_total_gb * (target_disk_pct / 100.0)
     available_for_data_gb = max(0, target_total_gb - current_disk_used_gb)
 
-    # TiKV stores replicas, so actual unique data is smaller
-    # But the disk usage is total (all replicas on same host in kind setup)
-    # unique_data_gb = available_for_data_gb / tikv_replica_count
-    # Actually in kind (single-host), all replicas share the same EBS,
-    # so the disk usage IS the total across replicas.
-    unique_data_gb = available_for_data_gb / tikv_replica_count
+    # With RF=3 across 3 TiKV nodes, each node stores ~100% of all data.
+    # So loading N GB of sysbench data -> each TiKV disk grows by ~N GB.
+    # No division by replica count needed.
 
     # Calculate rows needed
-    total_rows = int(unique_data_gb * (1024 ** 3) / SYSBENCH_ROW_DISK_BYTES)
+    total_rows = int(available_for_data_gb * (1024 ** 3) / SYSBENCH_ROW_DISK_BYTES)
     rows_per_table = max(10000, total_rows // num_tables)  # minimum 10K rows
 
-    # Estimated total disk usage after load
-    estimated_disk_gb = (rows_per_table * num_tables * SYSBENCH_ROW_DISK_BYTES * tikv_replica_count) / (1024 ** 3)
+    # Estimated disk usage after load (per TiKV node)
+    estimated_disk_gb = (rows_per_table * num_tables * SYSBENCH_ROW_DISK_BYTES) / (1024 ** 3)
     estimated_total_gb = current_disk_used_gb + estimated_disk_gb
 
     return {
         "target_data_gb": available_for_data_gb,
-        "unique_data_gb": unique_data_gb,
         "rows_per_table": rows_per_table,
         "total_rows": rows_per_table * num_tables,
         "estimated_disk_gb": estimated_disk_gb,
@@ -801,24 +805,11 @@ def run_bulk_data_load(
     log(f"  Benchmark DB: {disk_before['db_data_gb']:.2f}GB")
 
     # Step 2: Calculate load parameters
-    # Get TiKV replica count from cluster info
-    tikv_count = 3  # default
-    try:
-        result = ssh_capture(host, f'''
-mysql -h 127.0.0.1 -P {port} -u root -N -e "
-SELECT COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tikv';
-" 2>/dev/null
-''', key_path)
-        tikv_count = int(result.stdout.strip()) or 3
-    except (ValueError, AttributeError):
-        pass
-
     params = calculate_bulk_load_params(
         target_disk_pct=target_disk_pct,
         ebs_total_gb=disk_before['ebs_total_gb'],
         current_disk_used_gb=disk_before['ebs_used_gb'],
         num_tables=num_tables,
-        tikv_replica_count=tikv_count,
     )
 
     log("")
@@ -826,9 +817,8 @@ SELECT COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tikv';
     log(f"  Tables: {num_tables}")
     log(f"  Rows per table: {params['rows_per_table']:,}")
     log(f"  Total rows: {params['total_rows']:,}")
-    log(f"  Estimated data on disk: {params['estimated_disk_gb']:.1f}GB")
+    log(f"  Estimated data on disk (per TiKV node): {params['estimated_disk_gb']:.1f}GB")
     log(f"  Estimated total disk: {params['estimated_total_gb']:.1f}GB ({params['estimated_disk_pct']:.1f}%)")
-    log(f"  TiKV replicas: {tikv_count}")
     log("")
 
     # Step 3: Clean any existing benchmark tables and load fresh data
@@ -1839,11 +1829,11 @@ def _run_benchmark(args):
 
     # Determine instance types
     client_type = "c7g.2xlarge"  # Default
-    server_type = "c7g.2xlarge"  # Default (kind cluster runs on same host)
+    server_type = "c7g.2xlarge"  # Default
     for inst in inst_info.get("instances", []):
         if inst.get("type"):
             client_type = inst.get("type")
-            server_type = inst.get("type")  # Same host for kind setup
+            server_type = inst.get("type")
             break
 
     # Get cluster info for pod count
@@ -1914,11 +1904,12 @@ def _run_benchmark(args):
     # Print static monthly server hardware cost (excluding client and network)
     server_specs = AWS_COSTS["ec2"].get(server_type, {})
     server_hourly = server_specs.get("hourly", 0.29)
-    ebs_monthly = DEFAULT_EBS_SIZE_GB * AWS_COSTS["ebs"]["gp3_per_gb_month"]
-    server_compute_monthly = server_hourly * 730  # 1 host for kind setup
+    tikv_count = cluster_info.get("tikv_count", 3)
+    ebs_monthly = DEFAULT_EBS_SIZE_GB * tikv_count * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    server_compute_monthly = server_hourly * server_count * 730  # each pod on its own host
     server_total_monthly = server_compute_monthly + ebs_monthly
     log("")
-    log(f"Server Monthly Cost (excl. client & network): EC2=${server_compute_monthly:.0f} + EBS=${ebs_monthly:.0f} = ${server_total_monthly:.0f}/mo")
+    log(f"Server Monthly Cost ({server_count} hosts): EC2=${server_compute_monthly:.0f} + EBS=${ebs_monthly:.0f} = ${server_total_monthly:.0f}/mo")
     log("")
 
     total_queries = 0
