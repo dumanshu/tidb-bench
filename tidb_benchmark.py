@@ -40,11 +40,11 @@ WORKLOAD_PROFILES = {
 
 MULTI_PHASE_PROFILES = {
     "stress": {
-        "description": "CPU stress test: ramp-up, adaptive overload until QPS plateaus, then recover",
+        "description": "CPU stress test: ramp-up, push to breaking point, then recover",
         "phases": [
             {"name": "warmup", "threads": 32, "duration": 30},
             {"name": "ramp_up", "threads": 64, "duration": 30},
-            {"name": "overload", "threads": 128, "duration": 30, "adaptive": True, "thread_step": 32, "max_threads": 512, "plateau_threshold": 0.05},
+            {"name": "overload", "threads": 128, "duration": 30, "adaptive": True, "thread_step": 32, "max_threads": 512, "decay_threshold": 0.50, "latency_multiplier": 10},
             {"name": "recovery", "threads": 64, "duration": 30},
             {"name": "sustained", "threads": 48, "duration": 45},
         ],
@@ -483,22 +483,23 @@ def run_adaptive_phase(
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
 ) -> list:
-    """Run adaptive overload phase: increase threads until QPS plateaus."""
+    """Run adaptive overload phase: increase threads until system breaks (50% QPS decay or 10x latency)."""
     results = []
     start_threads = phase["threads"]
     thread_step = phase.get("thread_step", 32)
     max_threads = phase.get("max_threads", 512)
-    plateau_threshold = phase.get("plateau_threshold", 0.05)  # 5% improvement threshold
+    decay_threshold = phase.get("decay_threshold", 0.50)  # Stop when QPS drops 50% from peak
+    latency_multiplier = phase.get("latency_multiplier", 10)  # Stop when latency is 10x baseline
     phase_duration = phase.get("duration", 30)
     
     current_threads = start_threads
-    prev_qps = 0
     iteration = 0
     peak_qps = 0
     peak_threads = start_threads
+    baseline_p95 = None  # First iteration's P95 latency
     
     log(f"    Adaptive mode: starting at {start_threads} threads, step={thread_step}, max={max_threads}")
-    log(f"    Will stop when QPS improvement < {plateau_threshold*100:.0f}% threshold")
+    log(f"    Breaking conditions: QPS decay >= {decay_threshold*100:.0f}% OR latency >= {latency_multiplier}x baseline")
     
     while current_threads <= max_threads:
         iteration += 1
@@ -529,31 +530,44 @@ sysbench {workload} \\
         results.append(metrics)
         
         current_qps = metrics.get("throughput", {}).get("qps", 0)
-        tp = metrics.get("throughput", {})
         lat = metrics.get("latency", {})
+        current_p95 = lat.get("p95_ms", 0)
         
-        # Track peak
+        # Set baseline latency from first iteration
+        if baseline_p95 is None and current_p95 > 0:
+            baseline_p95 = current_p95
+            log(f"       Baseline P95 latency: {baseline_p95:.1f}ms")
+        
+        # Track peak QPS
         if current_qps > peak_qps:
             peak_qps = current_qps
             peak_threads = current_threads
         
-        # Calculate improvement
-        if prev_qps > 0:
-            improvement = (current_qps - prev_qps) / prev_qps
-            log(f"       QPS: {current_qps:,.1f} (prev: {prev_qps:,.1f}, change: {improvement*100:+.1f}%)")
-            log(f"       P95: {lat.get('p95_ms', 'N/A')}ms, P99: {lat.get('p99_ms', 'N/A')}ms")
-            
-            # Check if we've plateaued (improvement below threshold or negative)
-            if improvement < plateau_threshold:
-                log(f"")
-                log(f"    !! QPS plateau detected: improvement {improvement*100:.1f}% < {plateau_threshold*100:.0f}% threshold")
-                log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
-                break
-        else:
-            log(f"       QPS: {current_qps:,.1f} (baseline)")
-            log(f"       P95: {lat.get('p95_ms', 'N/A')}ms, P99: {lat.get('p99_ms', 'N/A')}ms")
+        # Calculate metrics
+        decay_from_peak = (peak_qps - current_qps) / peak_qps if peak_qps > 0 else 0
+        latency_ratio = current_p95 / baseline_p95 if baseline_p95 and baseline_p95 > 0 else 1
         
-        prev_qps = current_qps
+        log(f"       QPS: {current_qps:,.1f} | Peak: {peak_qps:,.1f} @ {peak_threads} thr | Decay: {decay_from_peak*100:.1f}%")
+        log(f"       P95: {current_p95:.1f}ms | Baseline: {baseline_p95:.1f}ms | Ratio: {latency_ratio:.1f}x")
+        
+        # Check breaking conditions
+        broken = False
+        break_reason = ""
+        
+        if decay_from_peak >= decay_threshold:
+            broken = True
+            break_reason = f"QPS decayed {decay_from_peak*100:.1f}% from peak (threshold: {decay_threshold*100:.0f}%)"
+        elif latency_ratio >= latency_multiplier:
+            broken = True
+            break_reason = f"Latency {latency_ratio:.1f}x baseline (threshold: {latency_multiplier}x)"
+        
+        if broken:
+            log(f"")
+            log(f"    !! BREAKING POINT REACHED: {break_reason}")
+            log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
+            log(f"    !! Final state: {current_qps:,.1f} QPS, {current_p95:.1f}ms P95 @ {current_threads} threads")
+            break
+        
         current_threads += thread_step
         
         # Brief pause between iterations to let system stabilize
@@ -562,7 +576,7 @@ sysbench {workload} \\
             time.sleep(3)
     
     if current_threads > max_threads:
-        log(f"    !! Reached max threads ({max_threads}) without plateau")
+        log(f"    !! Reached max threads ({max_threads}) without breaking")
         log(f"    !! Peak QPS: {peak_qps:,.1f} at {peak_threads} threads")
     
     return results
