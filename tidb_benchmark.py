@@ -10,6 +10,7 @@ Supports various workloads:
 """
 
 import argparse
+import re
 import os
 import subprocess
 import sys
@@ -588,6 +589,203 @@ def build_sysbench_cmd(
     return cmd
 
 
+# Regex to parse sysbench interval lines like:
+# [ 10s ] thds: 16 tps: 355.96 qps: 7136.79 (r/w/o: 4998.23/1425.04/713.52) lat (ms,99%): 61.08 err/s: 0.00 reconn/s: 0.00
+_INTERVAL_RE = re.compile(
+    r'\[\s*(\d+)s\s*\].*?tps:\s*([\d.]+).*?qps:\s*([\d.]+)'
+    r'.*?lat\s*\(ms,\d+%\):\s*([\d.]+).*?err/s:\s*([\d.]+)'
+)
+
+
+def parse_interval_line(line: str) -> dict:
+    """Parse a sysbench interval line into structured data."""
+    m = _INTERVAL_RE.match(line.strip())
+    if not m:
+        return None
+    return {
+        "elapsed_s": int(m.group(1)),
+        "tps": float(m.group(2)),
+        "qps": float(m.group(3)),
+        "p99_ms": float(m.group(4)),
+        "err_per_sec": float(m.group(5)),
+    }
+
+
+def fetch_resource_snapshot_compact(host: str, key_path: Path) -> str:
+    """Fetch a compact resource snapshot from the remote host. Returns formatted string."""
+    script = '''
+# Client CPU
+CPU=$(top -bn1 | grep "Cpu(s)" | awk '{printf "%.0f%%", $2+$4}' 2>/dev/null || echo "N/A")
+MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
+echo "CLIENT cpu=$CPU mem=$MEM"
+
+# Per-node resource from TiDB CLUSTER_LOAD
+mysql -h 127.0.0.1 -P 4000 -u root -N -e "
+SELECT
+    CONCAT('NODE ', TYPE, '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
+           ' cpu=', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
+           ' mem=', ROUND(MAX(CASE WHEN NAME='used-percent' AND DEVICE_TYPE='memory' THEN VALUE ELSE NULL END) * 100), '%')
+FROM information_schema.CLUSTER_LOAD
+WHERE (DEVICE_TYPE='cpu' AND DEVICE_NAME='usage') OR (DEVICE_TYPE='memory' AND DEVICE_NAME='virtual')
+GROUP BY TYPE, INSTANCE
+ORDER BY TYPE, INSTANCE;
+" 2>/dev/null || echo "NODE N/A"
+'''
+    result = ssh_capture(host, script, key_path)
+    return result.stdout.strip()
+
+
+def format_minute_report(minute: int, intervals: list, resource_text: str,
+                         cost_tracker=None, start_time: float = 0) -> str:
+    """Format a per-minute summary combining performance + resources."""
+    lines = []
+    elapsed = time.time() - start_time if start_time else minute * 60
+
+    # Aggregate interval data for this minute
+    if intervals:
+        avg_tps = sum(i['tps'] for i in intervals) / len(intervals)
+        avg_qps = sum(i['qps'] for i in intervals) / len(intervals)
+        max_p99 = max(i['p99_ms'] for i in intervals)
+        avg_p99 = sum(i['p99_ms'] for i in intervals) / len(intervals)
+        total_errs = sum(i['err_per_sec'] for i in intervals)
+        total_txns_est = sum(i['tps'] * 10 for i in intervals)  # each interval ~10s
+        avail = 100.0
+        if total_txns_est > 0 and total_errs > 0:
+            err_count_est = total_errs * 10 * len(intervals) / len(intervals)
+            avail = max(0, (1 - err_count_est / (total_txns_est + err_count_est)) * 100)
+        lines.append(f"--- Minute {minute} Report ---")
+        lines.append(f"  Perf:  TPS={avg_tps:,.1f}  QPS={avg_qps:,.1f}  P99={avg_p99:.1f}ms (max {max_p99:.1f}ms)  err/s={total_errs/len(intervals):.2f}  avail={avail:.2f}%")
+    else:
+        lines.append(f"--- Minute {minute} Report ---")
+        lines.append(f"  Perf:  (no interval data)")
+
+    # Parse resource text
+    client_line = ""
+    node_lines = []
+    if resource_text:
+        for rline in resource_text.split('\n'):
+            rline = rline.strip()
+            if rline.startswith('CLIENT '):
+                parts = rline.split()
+                client_line = ' '.join(parts[1:])
+            elif rline.startswith('NODE '):
+                # Format: NODE type-N cpu=X% mem=Y%
+                node_info = rline[5:].strip()  # strip 'NODE '
+                node_lines.append(node_info)
+
+    res_str = f"  Rsrc:  VM=[{client_line}]"
+    if node_lines:
+        res_str += f"  Nodes=[{', '.join(node_lines)}]"
+    lines.append(res_str)
+
+    # Cost
+    if cost_tracker:
+        summary = cost_tracker.get_summary(elapsed)
+        lines.append(f"  Cost:  ${summary['grand_total']:.4f} so far ({elapsed/60:.1f} min)")
+
+    return '\n'.join(lines)
+
+
+def ssh_stream(host: str, script: str, key_path: Path):
+    """Run a script on the remote host, streaming stdout line by line."""
+    full = "set -euo pipefail\n" + textwrap.dedent(script).lstrip()
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "ConnectTimeout=30",
+        "-i", str(key_path),
+        f"ec2-user@{host}",
+        "bash", "-s"
+    ]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True
+    )
+    proc.stdin.write(full)
+    proc.stdin.close()
+    return proc
+
+
+def run_sysbench_streaming(
+    host: str,
+    key_path: Path,
+    workload: str,
+    tables: int,
+    table_size: int,
+    threads: int,
+    duration: int,
+    report_interval: int,
+    port: int = DEFAULT_PORT,
+    database: str = DEFAULT_DATABASE,
+    cost_tracker=None,
+    benchmark_start_time: float = 0,
+) -> dict:
+    """Run sysbench with streaming output and per-minute reporting.
+
+    Streams sysbench output line-by-line, parses interval lines,
+    and prints a consolidated per-minute report with performance,
+    resource utilization, and cost data.
+    """
+    skip_trx = workload in ("oltp_read_only", "oltp_point_select")
+    cmd = build_sysbench_cmd(
+        workload, tables, table_size, threads, duration,
+        report_interval, port, database, skip_trx
+    )
+
+    proc = ssh_stream(host, cmd, key_path)
+
+    full_output = []
+    current_minute = 0
+    minute_intervals = []  # intervals for current minute
+    all_intervals = []
+
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip('\n')
+        full_output.append(line)
+
+        # Check if this is an interval line
+        iv = parse_interval_line(line)
+        if iv:
+            all_intervals.append(iv)
+            elapsed_s = iv['elapsed_s']
+            minute_of = (elapsed_s - 1) // 60 + 1  # which minute this belongs to
+
+            if minute_of > current_minute:
+                # Print report for the completed minute
+                if current_minute > 0 and minute_intervals:
+                    resource_text = fetch_resource_snapshot_compact(host, key_path)
+                    report = format_minute_report(
+                        current_minute, minute_intervals, resource_text,
+                        cost_tracker, benchmark_start_time
+                    )
+                    log(report)
+                    log("")
+                current_minute = minute_of
+                minute_intervals = []
+
+            minute_intervals.append(iv)
+        else:
+            # Print non-interval lines through log() so they go to log file too
+            if line.strip():
+                log(line)
+
+    proc.wait()
+
+    # Print final minute report if there are remaining intervals
+    if minute_intervals:
+        resource_text = fetch_resource_snapshot_compact(host, key_path)
+        report = format_minute_report(
+            current_minute, minute_intervals, resource_text,
+            cost_tracker, benchmark_start_time
+        )
+        log(report)
+        log("")
+
+    full_text = '\n'.join(full_output)
+    return parse_sysbench_output(full_text, workload)
+
 def set_session_variables(host: str, key_path: Path, port: int, workload: str):
     """Set TiDB session variables for benchmarking."""
     session_vars = SESSION_VARS_BASE
@@ -772,30 +970,24 @@ def run_sysbench_benchmark(
     report_interval: int,
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
+    cost_tracker=None,
+    benchmark_start_time: float = 0,
 ) -> dict:
-    """Run sysbench benchmark and return parsed metrics."""
+    """Run sysbench benchmark with per-minute reporting and return parsed metrics."""
     log(f"Running sysbench {workload} benchmark")
     log(f"  Tables: {tables}, Table size: {table_size:,}")
     log(f"  Threads: {threads}, Duration: {duration}s")
     log(f"  Error handling: ignoring errors {MYSQL_IGNORE_ERRORS}")
     
-    # Determine if we should skip transactions (read-only workloads)
     skip_trx = workload in ("oltp_read_only", "oltp_point_select")
     if skip_trx:
         log(f"  Read-only mode: --skip_trx=true")
     
-    cmd = build_sysbench_cmd(
-        workload, tables, table_size, threads, duration,
-        report_interval, port, database, skip_trx
+    return run_sysbench_streaming(
+        host, key_path, workload, tables, table_size,
+        threads, duration, report_interval, port, database,
+        cost_tracker, benchmark_start_time,
     )
-    
-    result = ssh_capture(host, cmd, key_path)
-    output = result.stdout
-    print(output)
-    
-    return parse_sysbench_output(output, workload)
-
-
 
 
 def print_workload_summary(workload: str, tables: int, table_size: int, 
@@ -1053,6 +1245,8 @@ def run_multi_phase_benchmark(
     port: int = DEFAULT_PORT,
     database: str = DEFAULT_DATABASE,
     resource_monitor: threading.Thread = None,
+    cost_tracker=None,
+    benchmark_start_time: float = 0,
 ) -> list:
     """Run multi-phase benchmark (stress or scaling profile)."""
     profile = MULTI_PHASE_PROFILES[profile_name]
@@ -1095,16 +1289,11 @@ def run_multi_phase_benchmark(
             )
             all_results.extend(phase_results)
         else:
-            cmd = build_sysbench_cmd(
-                workload, tables, table_size, threads, duration,
-                report_interval, port, database, skip_trx
+            metrics = run_sysbench_streaming(
+                host, key_path, workload, tables, table_size,
+                threads, duration, report_interval, port, database,
+                cost_tracker, benchmark_start_time,
             )
-            
-            result = ssh_capture(host, cmd, key_path)
-            output = result.stdout
-            print(output)
-            
-            metrics = parse_sysbench_output(output, workload)
             metrics["phase"] = phase_name
             metrics["threads"] = threads
             metrics["duration"] = duration
@@ -1195,18 +1384,29 @@ def fetch_final_resource_snapshot(host: str, key_path: Path):
     log("FINAL RESOURCE UTILIZATION")
     log("=" * 70)
     
-    script = """
+    script = '''
 echo "--- Client VM ---"
 echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{printf "%.1f%% user, %.1f%% sys, %.1f%% idle", $2, $4, $8}')"
 echo "Memory: $(free -h | awk 'NR==2{printf "%s used / %s total (%.1f%%)", $3, $2, $3*100/$2}')"
 echo "Load: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
 echo ""
-echo "--- TiDB Pods ---"
-kubectl top pods -n tidb-cluster --no-headers 2>/dev/null | awk '{printf "%-22s CPU: %-8s Mem: %s\\n", $1, $2, $3}' || echo "N/A"
-"""
-    ssh_run(host, script, key_path, strict=False)
+echo "--- TiDB Cluster Nodes ---"
+mysql -h 127.0.0.1 -P 4000 -u root -N -e "
+SELECT
+    CONCAT(UPPER(TYPE), '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
+           '  CPU: ', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
+           '  Mem: ', ROUND(MAX(CASE WHEN NAME='used-percent' AND DEVICE_TYPE='memory' THEN VALUE ELSE NULL END) * 100), '%')
+FROM information_schema.CLUSTER_LOAD
+WHERE (DEVICE_TYPE='cpu' AND DEVICE_NAME='usage') OR (DEVICE_TYPE='memory' AND DEVICE_NAME='virtual')
+GROUP BY TYPE, INSTANCE
+ORDER BY TYPE, INSTANCE;
+" 2>/dev/null || echo "N/A"
+'''
+    result = ssh_capture(host, script, key_path)
+    if result.stdout.strip():
+        for line in result.stdout.strip().split('\n'):
+            log(line)
     log("=" * 70)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1443,62 +1643,54 @@ def _run_benchmark(args):
         profile_name=args.profile,
     )
 
-    # Start resource monitoring (every 60 seconds)
-    resource_monitor = None
-    if not args.no_resource_monitor:
-        log("Starting per-minute resource monitoring with cost tracking...")
-        resource_monitor = start_resource_monitor(
-            host, key_path, interval=60,
-            cost_tracker=cost_tracker,
-            start_time=benchmark_start_time,
-        )
+    # Per-minute reporting is now built into the streaming benchmark runner.
+    # No separate resource monitor thread needed.
     total_queries = 0
     total_transactions = 0
     avg_qps = 0
     avg_tps = 0
-    try:
-        if multi_phase:
-            phase_results = run_multi_phase_benchmark(
-                host, key_path,
-                multi_phase,
-                args.workload,
-                tables, table_size,
-                args.report_interval,
-                args.port,
-                resource_monitor=resource_monitor,
-            )
-            print_multi_phase_summary(multi_phase, phase_results)
-            # Sum up queries and calculate weighted average throughput
-            total_duration = 0
-            weighted_qps = 0
-            weighted_tps = 0
-            for r in phase_results:
-                total_queries += r.get("queries", {}).get("total", 0)
-                total_transactions += r.get("transactions", {}).get("total", 0)
-                phase_dur = r.get("duration", 0)
-                total_duration += phase_dur
-                weighted_qps += r.get("throughput", {}).get("qps", 0) * phase_dur
-                weighted_tps += r.get("throughput", {}).get("tps", 0) * phase_dur
-            if total_duration > 0:
-                avg_qps = weighted_qps / total_duration
-                avg_tps = weighted_tps / total_duration
-        else:
-            benchmark_metrics = run_sysbench_benchmark(
-                host, key_path,
-                args.workload,
-                tables, table_size,
-                threads, duration, args.report_interval,
-                args.port,
-            )
-            print_metrics_summary(benchmark_metrics)
-            total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
-            total_transactions = benchmark_metrics.get("transactions", {}).get("total", 0)
-            avg_qps = benchmark_metrics.get("throughput", {}).get("qps", 0)
-            avg_tps = benchmark_metrics.get("throughput", {}).get("tps", 0)
-    finally:
-        # Stop resource monitor
-        if resource_monitor:
-            stop_resource_monitor(resource_monitor)
+
+    if multi_phase:
+        phase_results = run_multi_phase_benchmark(
+            host, key_path,
+            multi_phase,
+            args.workload,
+            tables, table_size,
+            args.report_interval,
+            args.port,
+            cost_tracker=cost_tracker,
+            benchmark_start_time=benchmark_start_time,
+        )
+        print_multi_phase_summary(multi_phase, phase_results)
+        # Sum up queries and calculate weighted average throughput
+        total_duration = 0
+        weighted_qps = 0
+        weighted_tps = 0
+        for r in phase_results:
+            total_queries += r.get("queries", {}).get("total", 0)
+            total_transactions += r.get("transactions", {}).get("total", 0)
+            phase_dur = r.get("duration", 0)
+            total_duration += phase_dur
+            weighted_qps += r.get("throughput", {}).get("qps", 0) * phase_dur
+            weighted_tps += r.get("throughput", {}).get("tps", 0) * phase_dur
+        if total_duration > 0:
+            avg_qps = weighted_qps / total_duration
+            avg_tps = weighted_tps / total_duration
+    else:
+        benchmark_metrics = run_sysbench_benchmark(
+            host, key_path,
+            args.workload,
+            tables, table_size,
+            threads, duration, args.report_interval,
+            args.port,
+            cost_tracker=cost_tracker,
+            benchmark_start_time=benchmark_start_time,
+        )
+        print_metrics_summary(benchmark_metrics)
+        total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
+        total_transactions = benchmark_metrics.get("transactions", {}).get("total", 0)
+        avg_qps = benchmark_metrics.get("throughput", {}).get("qps", 0)
+        avg_tps = benchmark_metrics.get("throughput", {}).get("tps", 0)
 
     # Calculate benchmark duration
     benchmark_end_time = time.time()
