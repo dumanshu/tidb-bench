@@ -97,11 +97,14 @@ class CostTracker:
         }
         self.metrics = {
             "total_queries": 0,
+            "total_transactions": 0,
             "total_bytes_transferred": 0,
             "client_instance_type": None,
             "server_instance_type": None,
             "server_instance_count": 0,
             "ebs_gb": 0,
+            "avg_qps": 0,
+            "avg_tps": 0,
         }
     
     def set_infrastructure(self, client_type: str, server_type: str, 
@@ -112,11 +115,18 @@ class CostTracker:
         self.metrics["server_instance_count"] = server_count
         self.metrics["ebs_gb"] = ebs_gb
     
-    def add_queries(self, query_count: int, avg_row_size_bytes: int = 200):
-        """Track query volume for network cost estimation."""
+    def add_queries(self, query_count: int, transaction_count: int = 0,
+                    avg_qps: float = 0, avg_tps: float = 0,
+                    avg_row_size_bytes: int = 200):
+        """Track query/transaction volume for cost and price-performance calculation."""
         self.metrics["total_queries"] += query_count
+        self.metrics["total_transactions"] += transaction_count
+        # Track throughput for price-performance
+        if avg_qps > 0:
+            self.metrics["avg_qps"] = avg_qps
+        if avg_tps > 0:
+            self.metrics["avg_tps"] = avg_tps
         # Estimate bytes: queries * avg response size
-        # Read queries return ~avg_row_size, writes send ~avg_row_size
         self.metrics["total_bytes_transferred"] += query_count * avg_row_size_bytes
     
     def calculate_costs(self, duration_seconds: float) -> dict:
@@ -199,16 +209,36 @@ class CostTracker:
         log("")
         log(f"Effective hourly rate: ${summary['hourly_rate']:.2f}/hr")
         
-        # Extrapolations
+        # Price-Performance Metrics
+        avg_qps = self.metrics.get("avg_qps", 0)
+        avg_tps = self.metrics.get("avg_tps", 0)
+        monthly_cost = summary['hourly_rate'] * 720
+        
+        if avg_qps > 0 or avg_tps > 0:
+            log("")
+            log("--- Price-Performance Metrics ---")
+            if avg_qps > 0:
+                cost_per_million_queries = (monthly_cost / avg_qps / 3600 / 720) * 1_000_000
+                log(f"Throughput: {avg_qps:,.1f} QPS")
+                log(f"Cost per 1M queries: ${cost_per_million_queries:.4f}")
+                log(f"Monthly $/QPS: ${monthly_cost / avg_qps:.4f}")
+            if avg_tps > 0:
+                cost_per_million_txns = (monthly_cost / avg_tps / 3600 / 720) * 1_000_000
+                log(f"Throughput: {avg_tps:,.1f} TPS")
+                log(f"Cost per 1M transactions: ${cost_per_million_txns:.4f}")
+                log(f"Monthly $/TPS: ${monthly_cost / avg_tps:.4f}")
+        
+        # Monthly Projections
         log("")
-        log("--- Cost Projections ---")
-        log(f"Per hour:  ${summary['hourly_rate']:.2f}")
-        log(f"Per day:   ${summary['hourly_rate'] * 24:.2f}")
-        log(f"Per month: ${summary['hourly_rate'] * 720:.2f}")
+        log("--- Monthly Cost Projections (730 hours) ---")
+        log(f"Compute: ${(c['compute']+s['compute']) / hours * 730:.2f}")
+        log(f"Storage: ${(c['storage']+s['storage']) / hours * 730:.2f}")
+        log(f"Network: ${(c['network']+s['network']) / hours * 730:.2f}")
+        log(f"TOTAL:   ${monthly_cost:.2f}/month")
         log("")
         log("Note: Costs are estimates based on us-east-1 on-demand pricing.")
         log("      Network costs assume 50% cross-AZ traffic in production.")
-        log("      Actual costs may vary based on reserved instances, savings plans.")
+        log("      Actual costs may vary with reserved instances or savings plans.")
         log("=" * 70)
 
 WORKLOAD_PROFILES = {
@@ -216,6 +246,10 @@ WORKLOAD_PROFILES = {
     "light": {"tables": 8, "table_size": 50000, "threads": 32, "duration": 60},
     "medium": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120},
     "heavy": {"tables": 32, "table_size": 500000, "threads": 128, "duration": 300},
+    # Standard price-performance profile based on PingCAP's official benchmarks
+    # Uses 16 tables x 100K rows (1.6M total), 64 threads, 5 minute duration
+    # Suitable for comparing $/QPS and $/TPS across configurations
+    "standard": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 300},
     "stress": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "stress"},
     "scaling": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "scaling"},
 }
@@ -727,6 +761,106 @@ def run_sysbench_benchmark(
     return parse_sysbench_output(output, workload)
 
 
+
+
+def print_workload_summary(workload: str, tables: int, table_size: int, 
+                          threads: int, duration: int, profile_name: str = None):
+    """Print a detailed summary of the workload that was executed."""
+    log("")
+    log("=" * 70)
+    log("WORKLOAD SUMMARY")
+    log("=" * 70)
+    
+    # Workload description
+    workload_descriptions = {
+        "oltp_read_write": {
+            "name": "OLTP Read-Write (Mixed)",
+            "description": "Simulates a typical OLTP application with mixed read/write operations",
+            "operations": [
+                "Point SELECT queries (primary key lookups)",
+                "Range SELECT queries (secondary index scans)",
+                "UPDATE statements (indexed columns)",
+                "DELETE + INSERT pairs (maintaining table size)",
+            ],
+            "read_write_ratio": "70% reads / 30% writes",
+            "transaction_type": "Multi-statement transactions with BEGIN/COMMIT",
+        },
+        "oltp_read_only": {
+            "name": "OLTP Read-Only",
+            "description": "Pure read workload simulating read-heavy applications",
+            "operations": [
+                "Point SELECT queries (primary key lookups)",
+                "Range SELECT queries (10 rows per query)",
+                "SUM aggregations on indexed columns",
+                "ORDER BY with LIMIT queries",
+                "DISTINCT SELECT queries",
+            ],
+            "read_write_ratio": "100% reads / 0% writes",
+            "transaction_type": "Read-only transactions (--skip_trx enabled)",
+        },
+        "oltp_write_only": {
+            "name": "OLTP Write-Only",
+            "description": "Pure write workload for testing write throughput",
+            "operations": [
+                "UPDATE statements on indexed columns",
+                "UPDATE statements on non-indexed columns",
+                "DELETE statements",
+                "INSERT statements",
+            ],
+            "read_write_ratio": "0% reads / 100% writes",
+            "transaction_type": "Multi-statement write transactions",
+        },
+        "oltp_point_select": {
+            "name": "OLTP Point Select",
+            "description": "Simple primary key lookups - tests raw read latency",
+            "operations": [
+                "Single-row SELECT by primary key",
+            ],
+            "read_write_ratio": "100% reads / 0% writes",
+            "transaction_type": "Simple queries (--skip_trx enabled)",
+        },
+    }
+    
+    wl_info = workload_descriptions.get(workload, {
+        "name": workload,
+        "description": f"Custom workload: {workload}",
+        "operations": ["Custom operations"],
+        "read_write_ratio": "Unknown",
+        "transaction_type": "Standard transactions",
+    })
+    
+    log(f"Workload: {wl_info['name']}")
+    if profile_name:
+        log(f"Profile:  {profile_name}")
+    log(f"")
+    log(f"Description: {wl_info['description']}")
+    log(f"")
+    
+    # Dataset info
+    total_rows = tables * table_size
+    estimated_size_mb = total_rows * 120 / (1024 * 1024)  # ~120 bytes per row
+    log(f"Dataset:")
+    log(f"  Tables:     {tables}")
+    log(f"  Rows/table: {table_size:,}")
+    log(f"  Total rows: {total_rows:,}")
+    log(f"  Est. size:  {estimated_size_mb:,.1f} MB")
+    log(f"")
+    
+    # Concurrency info
+    log(f"Concurrency:")
+    log(f"  Threads:    {threads} concurrent connections")
+    log(f"  Duration:   {duration} seconds")
+    log(f"")
+    
+    # Operations
+    log(f"Operations per transaction:")
+    for op in wl_info['operations']:
+        log(f"  • {op}")
+    log(f"")
+    log(f"Read/Write Ratio: {wl_info['read_write_ratio']}")
+    log(f"Transaction Mode: {wl_info['transaction_type']}")
+    log("=" * 70)
+
 def print_metrics_summary(metrics: dict):
     """Print a formatted summary of benchmark metrics."""
     log("")
@@ -1236,6 +1370,16 @@ def main():
         log("Tables prepared. Skipping benchmark (--prepare-only).")
         return
 
+    # Print workload summary before running
+    print_workload_summary(
+        workload=args.workload,
+        tables=tables,
+        table_size=table_size,
+        threads=threads,
+        duration=duration,
+        profile_name=args.profile,
+    )
+
     # Start resource monitoring (every 60 seconds)
     resource_monitor = None
     if not args.no_resource_monitor:
@@ -1245,8 +1389,10 @@ def main():
             cost_tracker=cost_tracker,
             start_time=benchmark_start_time,
         )
-
     total_queries = 0
+    total_transactions = 0
+    avg_qps = 0
+    avg_tps = 0
     try:
         if multi_phase:
             phase_results = run_multi_phase_benchmark(
@@ -1259,9 +1405,20 @@ def main():
                 resource_monitor=resource_monitor,
             )
             print_multi_phase_summary(multi_phase, phase_results)
-            # Sum up queries from all phases
+            # Sum up queries and calculate weighted average throughput
+            total_duration = 0
+            weighted_qps = 0
+            weighted_tps = 0
             for r in phase_results:
                 total_queries += r.get("queries", {}).get("total", 0)
+                total_transactions += r.get("transactions", {}).get("total", 0)
+                phase_dur = r.get("duration", 0)
+                total_duration += phase_dur
+                weighted_qps += r.get("throughput", {}).get("qps", 0) * phase_dur
+                weighted_tps += r.get("throughput", {}).get("tps", 0) * phase_dur
+            if total_duration > 0:
+                avg_qps = weighted_qps / total_duration
+                avg_tps = weighted_tps / total_duration
         else:
             benchmark_metrics = run_sysbench_benchmark(
                 host, key_path,
@@ -1272,6 +1429,9 @@ def main():
             )
             print_metrics_summary(benchmark_metrics)
             total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
+            total_transactions = benchmark_metrics.get("transactions", {}).get("total", 0)
+            avg_qps = benchmark_metrics.get("throughput", {}).get("qps", 0)
+            avg_tps = benchmark_metrics.get("throughput", {}).get("tps", 0)
     finally:
         # Stop resource monitor
         if resource_monitor:
@@ -1281,8 +1441,14 @@ def main():
     benchmark_end_time = time.time()
     actual_duration = benchmark_end_time - benchmark_start_time
 
-    # Track queries for network cost estimation
-    cost_tracker.add_queries(total_queries, avg_row_size_bytes=200)
+    # Track queries and throughput for cost and price-performance calculation
+    cost_tracker.add_queries(
+        query_count=total_queries,
+        transaction_count=total_transactions,
+        avg_qps=avg_qps,
+        avg_tps=avg_tps,
+        avg_row_size_bytes=200,
+    )
 
     # Final resource snapshot
     fetch_final_resource_snapshot(host, key_path)
