@@ -10,6 +10,7 @@ Supports various workloads:
 """
 
 import argparse
+import hashlib
 import re
 import os
 import subprocess
@@ -29,6 +30,25 @@ DEFAULT_SEED = "tidblt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
 DEFAULT_PORT = 4000
 DEFAULT_DATABASE = "sbtest"
+
+
+def seeded_database_name(seed: str) -> str:
+    """Derive a deterministic database name from a seed.
+
+    The name is always the same for a given seed, making cleanup reliable.
+    Format: sb_<first-8-hex-of-sha256>
+    """
+    h = hashlib.sha256(seed.encode()).hexdigest()[:8]
+    return f"sb_{h}"
+
+
+def seeded_table_name(seed: str, table_index: int) -> str:
+    """Derive a deterministic table name from seed and index.
+
+    sysbench uses sbtest1..sbtestN by default.  We keep the same prefix
+    so that the standard lua scripts work, but the DB name isolates runs.
+    """
+    return f"sbtest{table_index}"
 
 # TiDB session variables for benchmarking
 # These are safe for all workloads (read/write)
@@ -485,8 +505,10 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log("")
     
     # EBS storage details (per TiKV node — each node has its own EBS volume)
+    # Auto-detect EBS size from host filesystem rather than hardcoding
+    disk_info = get_disk_utilization(host, key_path, port, DEFAULT_EBS_SIZE_GB)
     ebs_type = "gp3"
-    ebs_size_gb = 600  # Default root volume size
+    ebs_size_gb = disk_info.get('ebs_total_gb', DEFAULT_EBS_SIZE_GB)
     ebs_iops = 3000    # gp3 baseline IOPS
     ebs_throughput = 125  # gp3 baseline MB/s
     
@@ -648,7 +670,8 @@ ORDER BY TYPE, INSTANCE;
 
 
 def get_disk_utilization(host: str, key_path: Path, port: int = DEFAULT_PORT,
-                        ebs_size_gb: int = DEFAULT_EBS_SIZE_GB) -> dict:
+                        ebs_size_gb: int = DEFAULT_EBS_SIZE_GB,
+                        database: str = DEFAULT_DATABASE) -> dict:
     """Measure current disk utilization from TiDB store sizes and EBS volume.
 
     Returns dict with:
@@ -670,8 +693,10 @@ echo "EBS_TOTAL=$EBS_TOTAL"
 echo "EBS_PCT=$EBS_PCT"
 
 # TiKV store sizes from INFORMATION_SCHEMA
+# CAPACITY = total store capacity, AVAILABLE = free space
+# Used bytes = CAPACITY - AVAILABLE
 mysql -h 127.0.0.1 -P {port} -u root -N -e "
-SELECT CONCAT('TIKV_STORE_BYTES=', IFNULL(SUM(AVAILABLE)+SUM(CAPACITY)-SUM(AVAILABLE), 0))
+SELECT CONCAT('TIKV_STORE_BYTES=', IFNULL(SUM(CAPACITY) - SUM(AVAILABLE), 0))
 FROM INFORMATION_SCHEMA.TIKV_STORE_STATUS;
 " 2>/dev/null || echo "TIKV_STORE_BYTES=0"
 
@@ -679,7 +704,7 @@ FROM INFORMATION_SCHEMA.TIKV_STORE_STATUS;
 mysql -h 127.0.0.1 -P {port} -u root -N -e "
 SELECT CONCAT('DB_DATA_BYTES=', IFNULL(SUM(data_length + index_length), 0))
 FROM information_schema.tables
-WHERE table_schema = 'sbtest';
+WHERE table_schema = '{database}';
 " 2>/dev/null || echo "DB_DATA_BYTES=0"
 '''
     result = ssh_capture(host, script, key_path)
@@ -798,7 +823,7 @@ def run_bulk_data_load(
     # Step 1: Measure current disk utilization
     log("")
     log("Measuring current disk utilization...")
-    disk_before = get_disk_utilization(host, key_path, port, ebs_size_gb)
+    disk_before = get_disk_utilization(host, key_path, port, ebs_size_gb, database)
     log(f"  EBS volume: {disk_before['ebs_total_gb']}GB total, "
         f"{disk_before['ebs_used_gb']}GB used ({disk_before['ebs_used_pct']}%)")
     log(f"  TiKV stores: {disk_before['tikv_store_gb']:.1f}GB ({disk_before['tikv_store_pct']:.1f}% of EBS)")
@@ -835,7 +860,7 @@ def run_bulk_data_load(
     log("Waiting 30s for TiKV compaction to settle...")
     time.sleep(30)
 
-    disk_after = get_disk_utilization(host, key_path, port, ebs_size_gb)
+    disk_after = get_disk_utilization(host, key_path, port, ebs_size_gb, database)
     log("")
     log("Disk utilization after bulk load:")
     log(f"  EBS volume: {disk_after['ebs_total_gb']}GB total, "
@@ -1126,7 +1151,7 @@ def run_sysbench_prepare(
     database: str = DEFAULT_DATABASE,
 ):
     """Prepare sysbench tables."""
-    log(f"Preparing sysbench tables: {tables} tables x {table_size:,} rows")
+    log(f"Preparing sysbench tables: {tables} tables x {table_size:,} rows in database '{database}'")
     
     estimated_row_size_bytes = 120
     total_rows = tables * table_size
@@ -1137,9 +1162,13 @@ def run_sysbench_prepare(
 # Create database if not exists
 mysql -h 127.0.0.1 -P {port} -u root -e "CREATE DATABASE IF NOT EXISTS {database};"
 
-# Drop existing tables if any
-for i in $(seq 1 {tables}); do
-    mysql -h 127.0.0.1 -P {port} -u root -D {database} -e "DROP TABLE IF EXISTS sbtest$i;" 2>/dev/null || true
+# Drop existing sbtest tables by name (handles leftover tables from previous runs)
+EXISTING=$(mysql -h 127.0.0.1 -P {port} -u root -D {database} -N -e "
+  SELECT table_name FROM information_schema.tables
+  WHERE table_schema = '{database}' AND table_name LIKE 'sbtest%';
+" 2>/dev/null || true)
+for tbl in $EXISTING; do
+    mysql -h 127.0.0.1 -P {port} -u root -D {database} -e "DROP TABLE IF EXISTS $tbl;" 2>/dev/null || true
 done
 
 # Run sysbench prepare
@@ -1791,11 +1820,14 @@ def _run_benchmark(args):
         host = discover_tidb_host(args.region, args.aws_profile, args.seed)
     log(f"Using TiDB host: {host}")
 
+    # Derive seeded database name — deterministic for a given seed
+    database = seeded_database_name(args.seed)
+    log(f"Using seeded database name: {database} (seed={args.seed})")
+
     if args.cleanup_only:
-        run_sysbench_cleanup(host, key_path, args.tables, args.port)
+        run_sysbench_cleanup(host, key_path, args.tables, args.port, database)
         log("Cleanup complete.")
         return
-
     # Load profile settings
     tables = args.tables
     table_size = args.table_size
@@ -1842,11 +1874,16 @@ def _run_benchmark(args):
                     cluster_info.get("tikv_count", 3) +
                     cluster_info.get("pd_count", 3))
 
+    # Auto-detect actual EBS volume size from the host
+    _disk_probe = get_disk_utilization(host, key_path, args.port, DEFAULT_EBS_SIZE_GB, database)
+    detected_ebs_gb = _disk_probe.get('ebs_total_gb', DEFAULT_EBS_SIZE_GB)
+    log(f"Detected EBS volume size: {detected_ebs_gb}GB")
+
     cost_tracker.set_infrastructure(
         client_type=client_type,
         server_type=server_type,
         server_count=server_count,
-        ebs_gb=DEFAULT_EBS_SIZE_GB,
+        ebs_gb=detected_ebs_gb,
     )
 
     benchmark_start_time = time.time()
@@ -1862,7 +1899,8 @@ def _run_benchmark(args):
             target_disk_pct=disk_fill_pct,
             num_tables=tables,
             port=args.port,
-            ebs_size_gb=DEFAULT_EBS_SIZE_GB,
+            database=database,
+            ebs_size_gb=detected_ebs_gb,
         )
         # Update table_size to match what was actually loaded
         table_size = load_stats["rows_per_table"]
@@ -1873,7 +1911,7 @@ def _run_benchmark(args):
         run_sysbench_prepare(
             host, key_path,
             tables, table_size,
-            args.port,
+            args.port, database,
         )
 
     if args.prepare_only:
@@ -1905,7 +1943,7 @@ def _run_benchmark(args):
     server_specs = AWS_COSTS["ec2"].get(server_type, {})
     server_hourly = server_specs.get("hourly", 0.29)
     tikv_count = cluster_info.get("tikv_count", 3)
-    ebs_monthly = DEFAULT_EBS_SIZE_GB * tikv_count * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    ebs_monthly = detected_ebs_gb * tikv_count * AWS_COSTS["ebs"]["gp3_per_gb_month"]
     server_compute_monthly = server_hourly * server_count * 730  # each pod on its own host
     server_total_monthly = server_compute_monthly + ebs_monthly
     log("")
@@ -1924,6 +1962,7 @@ def _run_benchmark(args):
             tables, table_size,
             args.report_interval,
             args.port,
+            database,
         )
         print_multi_phase_summary(multi_phase, phase_results)
         # Sum up queries and calculate weighted average throughput
@@ -1947,6 +1986,7 @@ def _run_benchmark(args):
             tables, table_size,
             threads, duration, args.report_interval,
             args.port,
+            database,
         )
         print_metrics_summary(benchmark_metrics)
         total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
@@ -1970,7 +2010,7 @@ def _run_benchmark(args):
     # Final resource snapshot + disk utilization
     fetch_final_resource_snapshot(host, key_path)
     if load_stats:
-        disk_final = get_disk_utilization(host, key_path, args.port, DEFAULT_EBS_SIZE_GB)
+        disk_final = get_disk_utilization(host, key_path, args.port, detected_ebs_gb, database)
         log("")
         log("--- Final Disk Utilization ---")
         log(f"  EBS: {disk_final['ebs_used_gb']}GB / {disk_final['ebs_total_gb']}GB ({disk_final['ebs_used_pct']}%)")
@@ -1981,7 +2021,7 @@ def _run_benchmark(args):
     cost_tracker.print_summary(actual_duration)
 
     if args.cleanup:
-        run_sysbench_cleanup(host, key_path, args.tables, args.port)
+        run_sysbench_cleanup(host, key_path, args.tables, args.port, database)
 
     log("Benchmark complete.")
 if __name__ == "__main__":
