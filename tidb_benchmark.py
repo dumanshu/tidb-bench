@@ -243,17 +243,24 @@ class CostTracker:
         log("=" * 70)
 
 WORKLOAD_PROFILES = {
-    "quick": {"tables": 4, "table_size": 10000, "threads": 16, "duration": 30},
-    "light": {"tables": 8, "table_size": 50000, "threads": 32, "duration": 60},
-    "medium": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120},
-    "heavy": {"tables": 32, "table_size": 500000, "threads": 128, "duration": 300},
+    "quick": {"tables": 4, "table_size": 10000, "threads": 16, "duration": 30, "disk_fill_pct": 30},
+    "light": {"tables": 8, "table_size": 50000, "threads": 32, "duration": 60, "disk_fill_pct": 30},
+    "medium": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "disk_fill_pct": 30},
+    "heavy": {"tables": 32, "table_size": 500000, "threads": 128, "duration": 300, "disk_fill_pct": 30},
     # Standard price-performance profile based on PingCAP's official benchmarks
     # Uses 16 tables x 100K rows (1.6M total), 64 threads, 5 minute duration
     # Suitable for comparing $/QPS and $/TPS across configurations
-    "standard": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 300},
-    "stress": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "stress"},
-    "scaling": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "scaling"},
+    "standard": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 300, "disk_fill_pct": 30},
+    "stress": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "stress", "disk_fill_pct": 30},
+    "scaling": {"tables": 16, "table_size": 100000, "threads": 64, "duration": 120, "multi_phase": "scaling", "disk_fill_pct": 30},
 }
+
+# Default EBS volume size in GB (root volume for kind cluster host)
+DEFAULT_EBS_SIZE_GB = 600
+
+# Average sysbench row size including indexes and TiDB overhead
+# Empirically ~240 bytes per row on disk (data + indexes + MVCC overhead)
+SYSBENCH_ROW_DISK_BYTES = 240
 
 MULTI_PHASE_PROFILES = {
     "stress": {
@@ -634,6 +641,230 @@ ORDER BY TYPE, INSTANCE;
     result = ssh_capture(host, script, key_path)
     return result.stdout.strip()
 
+
+def get_disk_utilization(host: str, key_path: Path, port: int = DEFAULT_PORT,
+                        ebs_size_gb: int = DEFAULT_EBS_SIZE_GB) -> dict:
+    """Measure current disk utilization from TiDB store sizes and EBS volume.
+
+    Returns dict with:
+      ebs_total_gb: Total EBS volume size
+      ebs_used_gb: Used space on EBS (from df)
+      ebs_used_pct: EBS used percentage
+      tikv_store_gb: Total TiKV store size (data on disk)
+      tikv_store_pct: TiKV store as % of EBS total
+      db_data_gb: Size of benchmark database data
+    """
+    script = f'''
+# EBS volume usage from df (root filesystem)
+DF_LINE=$(df -BG / | tail -1)
+EBS_USED=$(echo "$DF_LINE" | awk '{{print $3}}' | tr -d 'G')
+EBS_TOTAL=$(echo "$DF_LINE" | awk '{{print $2}}' | tr -d 'G')
+EBS_PCT=$(echo "$DF_LINE" | awk '{{print $5}}' | tr -d '%')
+echo "EBS_USED=$EBS_USED"
+echo "EBS_TOTAL=$EBS_TOTAL"
+echo "EBS_PCT=$EBS_PCT"
+
+# TiKV store sizes from INFORMATION_SCHEMA
+mysql -h 127.0.0.1 -P {port} -u root -N -e "
+SELECT CONCAT('TIKV_STORE_BYTES=', IFNULL(SUM(AVAILABLE)+SUM(CAPACITY)-SUM(AVAILABLE), 0))
+FROM INFORMATION_SCHEMA.TIKV_STORE_STATUS;
+" 2>/dev/null || echo "TIKV_STORE_BYTES=0"
+
+# Benchmark database size
+mysql -h 127.0.0.1 -P {port} -u root -N -e "
+SELECT CONCAT('DB_DATA_BYTES=', IFNULL(SUM(data_length + index_length), 0))
+FROM information_schema.tables
+WHERE table_schema = 'sbtest';
+" 2>/dev/null || echo "DB_DATA_BYTES=0"
+'''
+    result = ssh_capture(host, script, key_path)
+    info = {
+        "ebs_total_gb": ebs_size_gb,
+        "ebs_used_gb": 0,
+        "ebs_used_pct": 0,
+        "tikv_store_gb": 0,
+        "tikv_store_pct": 0,
+        "db_data_gb": 0,
+    }
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('EBS_USED='):
+            try:
+                info["ebs_used_gb"] = int(line.split('=')[1])
+            except ValueError:
+                pass
+        elif line.startswith('EBS_TOTAL='):
+            try:
+                val = int(line.split('=')[1])
+                if val > 0:
+                    info["ebs_total_gb"] = val
+            except ValueError:
+                pass
+        elif line.startswith('EBS_PCT='):
+            try:
+                info["ebs_used_pct"] = int(line.split('=')[1])
+            except ValueError:
+                pass
+        elif line.startswith('TIKV_STORE_BYTES='):
+            try:
+                b = int(line.split('=')[1])
+                info["tikv_store_gb"] = b / (1024 ** 3)
+                info["tikv_store_pct"] = (b / (1024 ** 3)) / info["ebs_total_gb"] * 100
+            except ValueError:
+                pass
+        elif line.startswith('DB_DATA_BYTES='):
+            try:
+                info["db_data_gb"] = int(line.split('=')[1]) / (1024 ** 3)
+            except ValueError:
+                pass
+    return info
+
+
+def calculate_bulk_load_params(
+    target_disk_pct: float,
+    ebs_total_gb: int,
+    current_disk_used_gb: float,
+    num_tables: int,
+    tikv_replica_count: int = 3,
+) -> dict:
+    """Calculate how many rows per table to load to reach target disk utilization.
+
+    Args:
+        target_disk_pct: Target disk utilization percentage (e.g. 30)
+        ebs_total_gb: Total EBS volume size in GB
+        current_disk_used_gb: Current disk usage in GB (OS + existing data)
+        num_tables: Number of sysbench tables to create
+        tikv_replica_count: Number of TiKV replicas (default 3)
+
+    Returns:
+        dict with target_data_gb, rows_per_table, estimated_total_gb
+    """
+    target_total_gb = ebs_total_gb * (target_disk_pct / 100.0)
+    available_for_data_gb = max(0, target_total_gb - current_disk_used_gb)
+
+    # TiKV stores replicas, so actual unique data is smaller
+    # But the disk usage is total (all replicas on same host in kind setup)
+    # unique_data_gb = available_for_data_gb / tikv_replica_count
+    # Actually in kind (single-host), all replicas share the same EBS,
+    # so the disk usage IS the total across replicas.
+    unique_data_gb = available_for_data_gb / tikv_replica_count
+
+    # Calculate rows needed
+    total_rows = int(unique_data_gb * (1024 ** 3) / SYSBENCH_ROW_DISK_BYTES)
+    rows_per_table = max(10000, total_rows // num_tables)  # minimum 10K rows
+
+    # Estimated total disk usage after load
+    estimated_disk_gb = (rows_per_table * num_tables * SYSBENCH_ROW_DISK_BYTES * tikv_replica_count) / (1024 ** 3)
+    estimated_total_gb = current_disk_used_gb + estimated_disk_gb
+
+    return {
+        "target_data_gb": available_for_data_gb,
+        "unique_data_gb": unique_data_gb,
+        "rows_per_table": rows_per_table,
+        "total_rows": rows_per_table * num_tables,
+        "estimated_disk_gb": estimated_disk_gb,
+        "estimated_total_gb": estimated_total_gb,
+        "estimated_disk_pct": (estimated_total_gb / ebs_total_gb) * 100,
+    }
+
+
+def run_bulk_data_load(
+    host: str,
+    key_path: Path,
+    target_disk_pct: float,
+    num_tables: int,
+    port: int = DEFAULT_PORT,
+    database: str = DEFAULT_DATABASE,
+    ebs_size_gb: int = DEFAULT_EBS_SIZE_GB,
+) -> dict:
+    """Phase 1: Bulk-load data to reach target disk utilization.
+
+    Measures current disk usage, calculates how many rows are needed to
+    reach the target percentage, then runs sysbench prepare with the
+    calculated table size. Verifies disk utilization after loading.
+
+    Returns dict with load stats including actual disk utilization achieved.
+    """
+    log("")
+    log("=" * 70)
+    log("PHASE 1: BULK DATA LOAD")
+    log(f"  Target disk utilization: {target_disk_pct}%")
+    log("=" * 70)
+
+    # Step 1: Measure current disk utilization
+    log("")
+    log("Measuring current disk utilization...")
+    disk_before = get_disk_utilization(host, key_path, port, ebs_size_gb)
+    log(f"  EBS volume: {disk_before['ebs_total_gb']}GB total, "
+        f"{disk_before['ebs_used_gb']}GB used ({disk_before['ebs_used_pct']}%)")
+    log(f"  TiKV stores: {disk_before['tikv_store_gb']:.1f}GB ({disk_before['tikv_store_pct']:.1f}% of EBS)")
+    log(f"  Benchmark DB: {disk_before['db_data_gb']:.2f}GB")
+
+    # Step 2: Calculate load parameters
+    # Get TiKV replica count from cluster info
+    tikv_count = 3  # default
+    try:
+        result = ssh_capture(host, f'''
+mysql -h 127.0.0.1 -P {port} -u root -N -e "
+SELECT COUNT(*) FROM information_schema.cluster_info WHERE TYPE='tikv';
+" 2>/dev/null
+''', key_path)
+        tikv_count = int(result.stdout.strip()) or 3
+    except (ValueError, AttributeError):
+        pass
+
+    params = calculate_bulk_load_params(
+        target_disk_pct=target_disk_pct,
+        ebs_total_gb=disk_before['ebs_total_gb'],
+        current_disk_used_gb=disk_before['ebs_used_gb'],
+        num_tables=num_tables,
+        tikv_replica_count=tikv_count,
+    )
+
+    log("")
+    log("Bulk load plan:")
+    log(f"  Tables: {num_tables}")
+    log(f"  Rows per table: {params['rows_per_table']:,}")
+    log(f"  Total rows: {params['total_rows']:,}")
+    log(f"  Estimated data on disk: {params['estimated_disk_gb']:.1f}GB")
+    log(f"  Estimated total disk: {params['estimated_total_gb']:.1f}GB ({params['estimated_disk_pct']:.1f}%)")
+    log(f"  TiKV replicas: {tikv_count}")
+    log("")
+
+    # Step 3: Clean any existing benchmark tables and load fresh data
+    load_start = time.time()
+    run_sysbench_prepare(
+        host, key_path,
+        num_tables, params['rows_per_table'],
+        port, database,
+    )
+    load_duration = time.time() - load_start
+
+    # Step 4: Wait for TiKV compaction to settle and verify disk utilization
+    log("")
+    log("Waiting 30s for TiKV compaction to settle...")
+    time.sleep(30)
+
+    disk_after = get_disk_utilization(host, key_path, port, ebs_size_gb)
+    log("")
+    log("Disk utilization after bulk load:")
+    log(f"  EBS volume: {disk_after['ebs_total_gb']}GB total, "
+        f"{disk_after['ebs_used_gb']}GB used ({disk_after['ebs_used_pct']}%)")
+    log(f"  TiKV stores: {disk_after['tikv_store_gb']:.1f}GB ({disk_after['tikv_store_pct']:.1f}% of EBS)")
+    log(f"  Benchmark DB: {disk_after['db_data_gb']:.2f}GB")
+    log(f"  Load time: {load_duration:.0f}s ({load_duration/60:.1f}min)")
+    log(f"  Load rate: {params['total_rows'] / load_duration:,.0f} rows/sec")
+    log("=" * 70)
+
+    return {
+        "tables": num_tables,
+        "rows_per_table": params['rows_per_table'],
+        "total_rows": params['total_rows'],
+        "disk_before": disk_before,
+        "disk_after": disk_after,
+        "load_duration_s": load_duration,
+        "load_rate_rows_per_sec": params['total_rows'] / load_duration if load_duration > 0 else 0,
+    }
 
 def format_minute_report(minute: int, intervals: list, resource_text: str) -> str:
     """Format a per-minute summary combining performance + resources."""
@@ -1505,6 +1736,17 @@ def parse_args():
         help="Disable per-minute resource monitoring during benchmark",
     )
     parser.add_argument(
+        "--no-disk-fill",
+        action="store_true",
+        help="Skip Phase 1 bulk data load (use profile's table_size as-is instead of filling to disk target)",
+    )
+    parser.add_argument(
+        "--disk-fill-pct",
+        type=int,
+        default=None,
+        help="Override disk fill target percentage (default: from profile, typically 30%%)",
+    )
+    parser.add_argument(
         "--output", "-o",
         help="Output log file path (auto-generates if not specified, use 'none' to disable)",
     )
@@ -1538,7 +1780,16 @@ def main():
 
 
 def _run_benchmark(args):
-    """Internal benchmark runner."""
+    """Internal benchmark runner.
+
+    Two-phase approach for every benchmark mode:
+      Phase 1 (Bulk Load): Fill disk to target utilization (default 30%)
+                           so benchmarks run against a realistic data volume.
+      Phase 2 (Benchmark):  Run the actual workload (updates + reads) against
+                           the pre-loaded data.
+
+    Use --no-disk-fill to skip Phase 1 and use the profile's table_size as-is.
+    """
     key_path = Path(args.ssh_key).expanduser().resolve()
     if not key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
@@ -1555,11 +1806,13 @@ def _run_benchmark(args):
         log("Cleanup complete.")
         return
 
+    # Load profile settings
     tables = args.tables
     table_size = args.table_size
     threads = args.threads
     duration = args.duration
-    
+    disk_fill_pct = args.disk_fill_pct
+
     if args.profile:
         profile = WORKLOAD_PROFILES[args.profile]
         tables = profile["tables"]
@@ -1567,19 +1820,23 @@ def _run_benchmark(args):
         threads = profile["threads"]
         duration = profile["duration"]
         multi_phase = profile.get("multi_phase")
-        log(f"Using profile '{args.profile}': {tables} tables, {table_size} rows, {threads} threads, {duration}s")
+        if disk_fill_pct is None:
+            disk_fill_pct = profile.get("disk_fill_pct", 30)
+        log(f"Using profile '{args.profile}': {tables} tables, {threads} threads, {duration}s")
         if multi_phase:
             log(f"  Multi-phase mode: {multi_phase}")
     else:
         multi_phase = None
+        if disk_fill_pct is None:
+            disk_fill_pct = 30  # default
 
     # Print cluster summary and get instance info for cost tracking
     print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
-    
+
     # Initialize cost tracker
     cost_tracker = CostTracker(region=args.region)
     inst_info = get_instance_info(args.region, args.aws_profile, args.seed)
-    
+
     # Determine instance types
     client_type = "c7g.2xlarge"  # Default
     server_type = "c7g.2xlarge"  # Default (kind cluster runs on same host)
@@ -1588,23 +1845,41 @@ def _run_benchmark(args):
             client_type = inst.get("type")
             server_type = inst.get("type")  # Same host for kind setup
             break
-    
+
     # Get cluster info for pod count
     cluster_info = get_cluster_info(host, key_path, args.port)
-    server_count = (cluster_info.get("tidb_count", 2) + 
-                    cluster_info.get("tikv_count", 3) + 
+    server_count = (cluster_info.get("tidb_count", 2) +
+                    cluster_info.get("tikv_count", 3) +
                     cluster_info.get("pd_count", 3))
-    
+
     cost_tracker.set_infrastructure(
         client_type=client_type,
         server_type=server_type,
         server_count=server_count,
-        ebs_gb=600,  # Default EBS size
+        ebs_gb=DEFAULT_EBS_SIZE_GB,
     )
-    
+
     benchmark_start_time = time.time()
 
-    if not args.skip_prepare:
+    # ── PHASE 1: BULK DATA LOAD ──────────────────────────────────────────
+    # Fill disk to target utilization so the benchmark runs against a
+    # realistic data volume.  Writes in Phase 2 will be UPDATEs on this
+    # pre-loaded data (not INSERTs into an empty database).
+    load_stats = None
+    if not args.no_disk_fill and not args.skip_prepare:
+        load_stats = run_bulk_data_load(
+            host, key_path,
+            target_disk_pct=disk_fill_pct,
+            num_tables=tables,
+            port=args.port,
+            ebs_size_gb=DEFAULT_EBS_SIZE_GB,
+        )
+        # Update table_size to match what was actually loaded
+        table_size = load_stats["rows_per_table"]
+        log(f"Phase 1 complete: {load_stats['total_rows']:,} rows loaded")
+        log(f"  Actual disk: {load_stats['disk_after']['ebs_used_pct']}% of {load_stats['disk_after']['ebs_total_gb']}GB EBS")
+    elif not args.skip_prepare:
+        # Legacy mode: prepare with profile's table_size (small dataset, no disk fill)
         run_sysbench_prepare(
             host, key_path,
             tables, table_size,
@@ -1614,6 +1889,17 @@ def _run_benchmark(args):
     if args.prepare_only:
         log("Tables prepared. Skipping benchmark (--prepare-only).")
         return
+
+    # ── PHASE 2: BENCHMARK (updates + reads) ─────────────────────────────
+    # The workload runs against the pre-loaded dataset:
+    #   - oltp_read_write: mixed UPDATE + SELECT (the default / recommended)
+    #   - oltp_read_only:  pure reads against the loaded data
+    #   - oltp_write_only: pure UPDATE/DELETE/INSERT on existing rows
+    #   - stress/scaling:  multi-phase with the loaded data
+    log("")
+    log("=" * 70)
+    log("PHASE 2: BENCHMARK (updates + reads on loaded data)")
+    log("=" * 70)
 
     # Print workload summary before running
     print_workload_summary(
@@ -1628,7 +1914,7 @@ def _run_benchmark(args):
     # Print static monthly server hardware cost (excluding client and network)
     server_specs = AWS_COSTS["ec2"].get(server_type, {})
     server_hourly = server_specs.get("hourly", 0.29)
-    ebs_monthly = 600 * AWS_COSTS["ebs"]["gp3_per_gb_month"]
+    ebs_monthly = DEFAULT_EBS_SIZE_GB * AWS_COSTS["ebs"]["gp3_per_gb_month"]
     server_compute_monthly = server_hourly * 730  # 1 host for kind setup
     server_total_monthly = server_compute_monthly + ebs_monthly
     log("")
@@ -1647,8 +1933,6 @@ def _run_benchmark(args):
             tables, table_size,
             args.report_interval,
             args.port,
-            cost_tracker=cost_tracker,
-            benchmark_start_time=benchmark_start_time,
         )
         print_multi_phase_summary(multi_phase, phase_results)
         # Sum up queries and calculate weighted average throughput
@@ -1672,8 +1956,6 @@ def _run_benchmark(args):
             tables, table_size,
             threads, duration, args.report_interval,
             args.port,
-            cost_tracker=cost_tracker,
-            benchmark_start_time=benchmark_start_time,
         )
         print_metrics_summary(benchmark_metrics)
         total_queries = benchmark_metrics.get("queries", {}).get("total", 0)
@@ -1694,9 +1976,16 @@ def _run_benchmark(args):
         avg_row_size_bytes=200,
     )
 
-    # Final resource snapshot
+    # Final resource snapshot + disk utilization
     fetch_final_resource_snapshot(host, key_path)
-    
+    if load_stats:
+        disk_final = get_disk_utilization(host, key_path, args.port, DEFAULT_EBS_SIZE_GB)
+        log("")
+        log("--- Final Disk Utilization ---")
+        log(f"  EBS: {disk_final['ebs_used_gb']}GB / {disk_final['ebs_total_gb']}GB ({disk_final['ebs_used_pct']}%)")
+        log(f"  TiKV stores: {disk_final['tikv_store_gb']:.1f}GB ({disk_final['tikv_store_pct']:.1f}%)")
+        log(f"  Benchmark DB: {disk_final['db_data_gb']:.2f}GB")
+
     # Print cost summary
     cost_tracker.print_summary(actual_duration)
 
@@ -1704,6 +1993,5 @@ def _run_benchmark(args):
         run_sysbench_cleanup(host, key_path, args.tables, args.port)
 
     log("Benchmark complete.")
-
 if __name__ == "__main__":
     main()
