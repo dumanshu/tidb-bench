@@ -40,8 +40,9 @@ BOTO_CONFIG = Config(
     read_timeout=60,
 )
 
-# Default instance type for single-node deployment
-INSTANCE_TYPE = "c7g.2xlarge"
+# Default instance type for single-node deployment (client VM)
+# c7g.4xlarge provides 16 vCPU, 32GB RAM - enough headroom for sysbench client
+INSTANCE_TYPE = "c7g.4xlarge"
 
 # PingCAP recommended production instance types (AWS)
 # https://docs.pingcap.com/tidb/stable/hardware-and-software-requirements
