@@ -286,14 +286,21 @@ BOTO_CONFIG = Config(
     read_timeout=60,
 )
 
+# Global log file handle
+_log_file = None
+
 
 def ts():
     return datetime.now().strftime("[%Y-%m-%dT%H:%M:%S]")
 
 
 def log(msg):
-    print(f"{ts()} {msg}", flush=True)
-
+    """Log message to stdout and optionally to log file."""
+    line = f"{ts()} {msg}"
+    print(line, flush=True)
+    if _log_file:
+        _log_file.write(line + "\n")
+        _log_file.flush()
 
 def ec2_client(profile: Optional[str], region: str):
     session = boto3.session.Session(profile_name=profile, region_name=region)
@@ -1315,13 +1322,41 @@ def parse_args():
         action="store_true",
         help="Disable per-minute resource monitoring during benchmark",
     )
+    parser.add_argument(
+        "--output", "-o",
+        help="Output log file path (auto-generates if not specified, use 'none' to disable)",
+    )
 
     return parser.parse_args()
 
 
 def main():
+    global _log_file
     args = parse_args()
 
+    # Set up log file output
+    log_path = None
+    if args.output and args.output.lower() != 'none':
+        log_path = Path(args.output).expanduser().resolve()
+    elif args.output is None:  # Auto-generate log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = Path(f"tidb_benchmark_{args.profile}_{timestamp}.log").resolve()
+
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _log_file = open(log_path, 'w')
+        print(f"Logging output to: {log_path}")
+
+    try:
+        _run_benchmark(args)
+    finally:
+        if _log_file:
+            _log_file.close()
+            print(f"\nLog saved to: {log_path}")
+
+
+def _run_benchmark(args):
+    """Internal benchmark runner."""
     key_path = Path(args.ssh_key).expanduser().resolve()
     if not key_path.exists():
         raise SystemExit(f"ERROR: SSH key not found: {key_path}")
