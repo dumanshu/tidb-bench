@@ -2,30 +2,34 @@
 """
 TiDB Load Test Stack Provisioner
 
-Provisions AWS infrastructure and bootstraps a TiDB cluster using TiDB Operator on kind.
-Based on the valkey-bench pattern for consistency.
+Provisions AWS infrastructure and bootstraps a TiDB cluster using TiDB Operator
+on a multi-node k3s cluster across dedicated EC2 instances.
 
 Architecture:
-- 1 EC2 instance (bastion/k8s host) in public subnet
-  - Runs kind (Kubernetes in Docker)
-  - TiDB Operator manages the TiDB cluster
-  - sysbench runs benchmarks
+- 1 client EC2 (k3s server / control plane + sysbench)
+- 3 PD EC2 instances (k3s agents, labeled for PD pods)
+- 3 TiKV EC2 instances (k3s agents, labeled for TiKV pods)
+- 2 TiDB EC2 instances (k3s agents, labeled for TiDB pods)
+- All nodes in a single VPC/subnet with self-referencing SG for intra-cluster traffic
 """
 
 import argparse
+import base64
 import boto3
 import botocore
 from botocore.config import Config
 import ipaddress
+import json
 import os
 import shutil
 import subprocess
 import textwrap
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 REGION = "us-east-1"
 AWS_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
@@ -40,9 +44,9 @@ BOTO_CONFIG = Config(
     read_timeout=60,
 )
 
-# Default instance type for single-node deployment (client VM)
+# Default instance type for client VM (sysbench runner)
 # c7g.4xlarge provides 16 vCPU, 32GB RAM - enough headroom for sysbench client
-INSTANCE_TYPE = "c7g.4xlarge"
+CLIENT_INSTANCE_TYPE = "c7g.4xlarge"
 
 # PingCAP recommended production instance types (AWS)
 # https://docs.pingcap.com/tidb/stable/hardware-and-software-requirements
@@ -50,6 +54,7 @@ PRODUCTION_INSTANCE_TYPES = {
     "pd": "c7g.xlarge",      # 4 vCPU, 8GB - metadata/scheduling
     "tidb": "c7g.4xlarge",   # 16 vCPU, 32GB - compute optimized for SQL
     "tikv": "m7g.4xlarge",   # 16 vCPU, 64GB - memory optimized for storage
+    "client": "c7g.4xlarge", # 16 vCPU, 32GB - benchmark client
 }
 
 # Cost-optimized instance types for testing/benchmarking
@@ -57,6 +62,7 @@ BENCHMARK_INSTANCE_TYPES = {
     "pd": "c7g.large",       # 2 vCPU, 4GB
     "tidb": "c7g.2xlarge",   # 8 vCPU, 16GB
     "tikv": "m7g.2xlarge",   # 8 vCPU, 32GB
+    "client": "c7g.2xlarge", # 8 vCPU, 16GB
 }
 
 # EBS gp3 storage recommendations from PingCAP
@@ -74,6 +80,14 @@ EBS_CONFIG = {
         "throughput": 125,  # MiB/s
         "size_gb": 50,
     },
+}
+
+# Root volume sizes per role (GB)
+ROOT_VOLUME_SIZES = {
+    "client": 100,
+    "pd": 50,
+    "tikv": 500,
+    "tidb": 50,
 }
 
 # Multi-AZ configuration
@@ -95,16 +109,23 @@ PUB_CIDR = "10.43.1.0/24"
 TIDB_PORT = 4000
 SSH_PORT = 22
 
+# k3s ports for inter-node communication
+K3S_API_PORT = 6443
+K3S_FLANNEL_PORT = 8472  # UDP VXLAN
+KUBELET_PORT = 10250
+
 TIDB_OPERATOR_VERSION = os.environ.get("TIDB_OPERATOR_VERSION", "v1.6.5")
 TIDB_VERSION = os.environ.get("TIDB_VERSION", "v8.5.5")
-KIND_VERSION = os.environ.get("KIND_VERSION", "v0.24.0")
 HELM_VERSION = os.environ.get("HELM_VERSION", "v3.16.3")
 KUBECTL_VERSION = os.environ.get("KUBECTL_VERSION", "v1.31.0")
+
+# All roles that get their own EC2 instances
+COMPONENT_ROLES = ["pd", "tikv", "tidb"]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Provision TiDB load test stack using TiDB Operator on kind."
+        description="Provision TiDB load test stack on multi-node k3s cluster."
     )
     parser.add_argument("--region", default=REGION, help="AWS region (default: us-east-1)")
     parser.add_argument("--seed", default=SEED, help="Unique seed used in stack name.")
@@ -119,11 +140,6 @@ def parse_args():
     parser.add_argument("--aws-profile", help="AWS named profile (default: sandbox or $AWS_PROFILE).")
     parser.add_argument("--skip-bootstrap", action="store_true", help="Provision infrastructure only.")
     parser.add_argument("--cleanup", action="store_true", help="Tear down stack resources.")
-    parser.add_argument(
-        "--instance-type",
-        default=INSTANCE_TYPE,
-        help=f"EC2 instance type (default: {INSTANCE_TYPE}).",
-    )
     parser.add_argument(
         "--tidb-version",
         default=TIDB_VERSION,
@@ -275,27 +291,54 @@ def ensure_keypair_accessible():
         raise
 
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclass
 class InstanceInfo:
     role: str
     instance_id: str
     public_ip: str
     private_ip: str
+    availability_zone: str = ""
 
 
 @dataclass
 class BootstrapContext:
     ssh_key_path: Path
     self_cidr: str
-    host: InstanceInfo
-    tidb_version: str
-    pd_replicas: int
-    tikv_replicas: int
-    tidb_replicas: int
+    client: InstanceInfo
+    pd_nodes: List[InstanceInfo] = field(default_factory=list)
+    tikv_nodes: List[InstanceInfo] = field(default_factory=list)
+    tidb_nodes: List[InstanceInfo] = field(default_factory=list)
+    tidb_version: str = TIDB_VERSION
+    pd_replicas: int = 3
+    tikv_replicas: int = 3
+    tidb_replicas: int = 2
     multi_az: bool = False
     production: bool = False
     client_zone: str = "us-east-1a"
 
+    @property
+    def host(self) -> InstanceInfo:
+        """Backward compatibility: client is the main host for SSH operations."""
+        return self.client
+
+    @property
+    def all_agent_nodes(self) -> List[InstanceInfo]:
+        """All k3s agent nodes (everything except client/server)."""
+        return self.pd_nodes + self.tikv_nodes + self.tidb_nodes
+
+    @property
+    def all_nodes(self) -> List[InstanceInfo]:
+        """All nodes including client."""
+        return [self.client] + self.all_agent_nodes
+
+
+# ---------------------------------------------------------------------------
+# EC2 / Instance helpers
+# ---------------------------------------------------------------------------
 
 def describe_instance(iid):
     resp = ec2().describe_instances(InstanceIds=[iid])
@@ -344,6 +387,10 @@ def tags_common():
         tags.append({"Key": "Owner", "Value": OWNER})
     return tags
 
+
+# ---------------------------------------------------------------------------
+# VPC / Network
+# ---------------------------------------------------------------------------
 
 def get_vpcs():
     resp = ec2().describe_vpcs(
@@ -410,15 +457,17 @@ def find_subnet(vpc_id, name, cidr):
     return None, None
 
 
-def ensure_subnet(vpc_id, name, cidr, public=False):
+def ensure_subnet(vpc_id, name, cidr, az=None, public=False):
+    """Create or reuse a subnet. If az is None, defaults to {REGION}a."""
     sn, tags = find_subnet(vpc_id, name, cidr)
     if sn:
         log(f"REUSED  subnet: {sn}")
         return sn
+    availability_zone = az or f"{REGION}a"
     resp = ec2().create_subnet(
         VpcId=vpc_id,
         CidrBlock=cidr,
-        AvailabilityZone=f"{REGION}a",
+        AvailabilityZone=availability_zone,
         TagSpecifications=[{
             "ResourceType": "subnet",
             "Tags": tags_common() + [{"Key": "Name", "Value": name}]
@@ -427,7 +476,7 @@ def ensure_subnet(vpc_id, name, cidr, public=False):
     subnet_id = resp["Subnet"]["SubnetId"]
     if public:
         ec2().modify_subnet_attribute(SubnetId=subnet_id, MapPublicIpOnLaunch={"Value": True})
-    log(f"CREATED subnet: {subnet_id}")
+    log(f"CREATED subnet: {subnet_id} (AZ: {availability_zone})")
     return subnet_id
 
 
@@ -439,7 +488,8 @@ def find_rtb_by_name(name):
     return rtbs[0]["RouteTableId"] if rtbs else None
 
 
-def ensure_public_rtb(vpc_id, igw_id, public_subnet_id):
+def ensure_public_rtb(vpc_id, igw_id, subnet_ids):
+    """Create/reuse a public route table and associate it with all given subnets."""
     name = f"{STACK}-rtb-public"
     rtb = find_rtb_by_name(name)
     if not rtb:
@@ -455,13 +505,20 @@ def ensure_public_rtb(vpc_id, igw_id, public_subnet_id):
         log(f"CREATED rtb public: {rtb}")
     else:
         log(f"REUSED  rtb public: {rtb}")
-    try:
-        ec2().associate_route_table(RouteTableId=rtb, SubnetId=public_subnet_id)
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] != "Resource.AlreadyAssociated":
-            raise
+    if isinstance(subnet_ids, str):
+        subnet_ids = [subnet_ids]
+    for subnet_id in subnet_ids:
+        try:
+            ec2().associate_route_table(RouteTableId=rtb, SubnetId=subnet_id)
+        except botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] != "Resource.AlreadyAssociated":
+                raise
     return rtb
 
+
+# ---------------------------------------------------------------------------
+# Security Groups
+# ---------------------------------------------------------------------------
 
 def ensure_sg(vpc_id, name, description):
     resp = ec2().describe_security_groups(
@@ -501,6 +558,29 @@ def ensure_ingress_tcp_cidr(sg, port, cidr):
         raise
 
 
+def ensure_intra_cluster_rules(sg_id):
+    """Allow all traffic between instances in the same security group.
+
+    This is needed for k3s API (6443), kubelet (10250), flannel VXLAN (8472/UDP),
+    TiDB/TiKV/PD inter-node communication, and CoreDNS.
+    """
+    try:
+        ec2().authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[{
+                "IpProtocol": "-1",  # All traffic
+                "UserIdGroupPairs": [{"GroupId": sg_id}]
+            }]
+        )
+        log(f"CREATED intra-cluster SG rule (self-referencing): {sg_id}")
+        return True
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+            log(f"REUSED  intra-cluster SG rule: {sg_id}")
+            return False
+        raise
+
+
 def refresh_ssh_rule(sg_id, cidr):
     if not cidr:
         return
@@ -533,6 +613,10 @@ def refresh_ssh_rule(sg_id, cidr):
         ensure_ingress_tcp_cidr(sg_id, SSH_PORT, cidr)
 
 
+# ---------------------------------------------------------------------------
+# EC2 Instances
+# ---------------------------------------------------------------------------
+
 def find_instance_id_by_name(name):
     resp = ec2().describe_instances(
         Filters=[{"Name": "tag:Name", "Values": [name]},
@@ -543,6 +627,25 @@ def find_instance_id_by_name(name):
         for inst in res.get("Instances", []):
             return inst["InstanceId"]
     return None
+
+
+def find_all_stack_instances():
+    """Find all running/pending instances in this stack."""
+    resp = ec2().describe_instances(
+        Filters=[{"Name": "tag:Project", "Values": [STACK]},
+                 {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}]
+    )
+    instances = []
+    for res in resp.get("Reservations", []):
+        for inst in res.get("Instances", []):
+            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            instances.append({
+                "id": inst["InstanceId"],
+                "name": tags.get("Name", ""),
+                "role": tags.get("Role", "unknown"),
+                "state": inst["State"]["Name"],
+            })
+    return instances
 
 
 def wait_running(iid):
@@ -590,15 +693,41 @@ def ensure_instance(name, role, itype, subnet_id, sg_id, root_volume_size=100):
     return iid
 
 
-def install_docker(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing Docker on {host.role}")
+def instance_info_from_id(iid, role) -> InstanceInfo:
+    """Build InstanceInfo from an instance ID after it's running."""
+    inst = describe_instance(iid)
+    return InstanceInfo(
+        role=role,
+        instance_id=iid,
+        public_ip=inst.get("PublicIpAddress", ""),
+        private_ip=inst.get("PrivateIpAddress", ""),
+        availability_zone=inst.get("Placement", {}).get("AvailabilityZone", ""),
+    )
+
+
+def provision_role_instances(role, count, instance_types, subnet_id, sg_id, production):
+    """Provision `count` EC2 instances for a given role. Returns list of instance IDs."""
+    types = PRODUCTION_INSTANCE_TYPES if production else BENCHMARK_INSTANCE_TYPES
+    itype = types.get(role, instance_types.get(role, CLIENT_INSTANCE_TYPE))
+    vol_size = ROOT_VOLUME_SIZES.get(role, 100)
+    ids = []
+    for i in range(1, count + 1):
+        name = f"{STACK}-{role}-{i}"
+        iid = ensure_instance(name, role, itype, subnet_id, sg_id, vol_size)
+        ids.append(iid)
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Software Installation (shared across nodes)
+# ---------------------------------------------------------------------------
+
+def install_base_packages(host: InstanceInfo, ctx: BootstrapContext):
+    """Install base OS packages and tune sysctl on any node."""
+    log(f"Installing base packages on {host.role} ({host.public_ip})")
     ssh_run(host, """
 sudo dnf -y update || true
-sudo dnf -y install docker git jq htop sysstat mtr || true
-
-sudo systemctl enable docker
-sudo systemctl start docker
-sudo usermod -aG docker ec2-user
+sudo dnf -y install jq htop sysstat mtr || true
 
 sudo tee /etc/sysctl.d/99-k8s.conf >/dev/null <<'EOF'
 net.bridge.bridge-nf-call-iptables = 1
@@ -643,27 +772,147 @@ sudo sysctl --system || true
 """, ctx)
 
 
-def install_kubectl(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing kubectl on {host.role}")
-    ssh_run(host, f"""
-if command -v kubectl >/dev/null 2>&1; then
-    echo "kubectl already installed"
+# ---------------------------------------------------------------------------
+# k3s Installation (replaces kind + Docker)
+# ---------------------------------------------------------------------------
+
+def install_k3s_server(client: InstanceInfo, ctx: BootstrapContext):
+    """Install k3s in server (control-plane) mode on the client node.
+
+    Disables traefik, servicelb, and local-storage (not needed for TiDB).
+    Taints the control-plane node so TiDB pods don't schedule on it.
+    """
+    log(f"Installing k3s server on client ({client.public_ip})")
+    ssh_run(client, f"""
+# Check if k3s is already running
+if sudo systemctl is-active k3s >/dev/null 2>&1; then
+    echo "k3s server already running"
+    sudo k3s kubectl get nodes || true
     exit 0
 fi
 
-ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ]; then
-    ARCH="arm64"
-elif [ "$ARCH" = "x86_64" ]; then
-    ARCH="amd64"
-fi
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+  --disable=traefik,servicelb,local-storage \
+  --tls-san={client.private_ip} \
+  --tls-san={client.public_ip} \
+  --node-taint=node-role.kubernetes.io/control-plane:NoSchedule \
+  --write-kubeconfig-mode=644" sh -
 
-curl -LO "https://dl.k8s.io/release/{KUBECTL_VERSION}/bin/linux/$ARCH/kubectl"
-chmod +x kubectl
-sudo mv kubectl /usr/local/bin/
-kubectl version --client || true
+# Wait for k3s to be ready
+for i in $(seq 1 30); do
+    if sudo k3s kubectl get nodes >/dev/null 2>&1; then
+        echo "k3s server ready"
+        break
+    fi
+    echo "Waiting for k3s server... (attempt $i/30)"
+    sleep 5
+done
+
+# Set up kubeconfig for ec2-user
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $(id -u):$(id -g) ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Verify
+kubectl get nodes
+echo "k3s server installed successfully"
 """, ctx)
 
+
+def get_k3s_token(client: InstanceInfo, ctx: BootstrapContext) -> str:
+    """Retrieve the k3s node-token from the server node."""
+    result = ssh_capture(client, """
+sudo cat /var/lib/rancher/k3s/server/node-token
+""", ctx)
+    return result.stdout.strip()
+
+
+def install_k3s_agent(agent: InstanceInfo, server_ip: str, token: str, ctx: BootstrapContext):
+    """Install k3s agent on a worker node and join it to the cluster."""
+    log(f"Joining k3s agent {agent.role} ({agent.public_ip}) to server {server_ip}")
+    ssh_run(agent, f"""
+# Check if k3s-agent is already running
+if sudo systemctl is-active k3s-agent >/dev/null 2>&1; then
+    echo "k3s agent already running on {agent.role}"
+    exit 0
+fi
+
+curl -sfL https://get.k3s.io | K3S_URL="https://{server_ip}:6443" \
+  K3S_TOKEN="{token}" sh -
+
+# Wait for agent to register
+for i in $(seq 1 20); do
+    if sudo systemctl is-active k3s-agent >/dev/null 2>&1; then
+        echo "k3s agent started on {agent.role}"
+        break
+    fi
+    echo "Waiting for k3s agent... (attempt $i/20)"
+    sleep 5
+done
+""", ctx)
+
+
+def label_and_taint_nodes(ctx: BootstrapContext):
+    """Label and taint all agent nodes from the k3s server.
+
+    This ensures TiDB Operator schedules each component to the correct node.
+    """
+    log("Labeling and tainting k3s agent nodes for TiDB scheduling")
+
+    # Wait for all agents to register
+    total_agents = len(ctx.all_agent_nodes)
+    ssh_run(ctx.client, f"""
+echo "Waiting for {total_agents} agent nodes to register..."
+for i in $(seq 1 60); do
+    COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
+    # Total = agents + 1 server
+    if [ "$COUNT" -ge "{total_agents + 1}" ]; then
+        echo "All {total_agents + 1} nodes registered"
+        break
+    fi
+    echo "Nodes registered: $COUNT/{total_agents + 1} (attempt $i/60)"
+    sleep 10
+done
+kubectl get nodes -o wide
+""", ctx)
+
+    # Label and taint each node by matching on private IP (k3s uses the IP as node name)
+    for node in ctx.pd_nodes:
+        _label_taint_node(ctx, node.private_ip, "pd")
+    for node in ctx.tikv_nodes:
+        _label_taint_node(ctx, node.private_ip, "tikv")
+    for node in ctx.tidb_nodes:
+        _label_taint_node(ctx, node.private_ip, "tidb")
+
+
+def _label_taint_node(ctx: BootstrapContext, node_ip: str, component: str):
+    """Label and taint a single k3s node by its IP address."""
+    ssh_run(ctx.client, f"""
+# Find the node name by IP
+NODE_NAME=$(kubectl get nodes -o jsonpath='{{.items[?(@.status.addresses[?(@.type=="InternalIP")].address=="{node_ip}")].metadata.name}}')
+if [ -z "$NODE_NAME" ]; then
+    echo "WARNING: Could not find node with IP {node_ip}, trying hostname-based lookup..."
+    NODE_NAME=$(kubectl get nodes -o wide --no-headers | grep "{node_ip}" | awk '{{print $1}}')
+fi
+if [ -z "$NODE_NAME" ]; then
+    echo "ERROR: Could not find node with IP {node_ip}"
+    exit 1
+fi
+
+echo "Labeling node $NODE_NAME as {component} (IP: {node_ip})"
+kubectl label node "$NODE_NAME" tidb.pingcap.com/{component}="" --overwrite
+kubectl taint node "$NODE_NAME" tidb.pingcap.com/{component}:NoSchedule --overwrite 2>/dev/null || \
+    kubectl taint node "$NODE_NAME" tidb.pingcap.com/{component}=:NoSchedule 2>/dev/null || true
+
+# Also add a zone label based on the node's AZ for topology-aware scheduling
+kubectl label node "$NODE_NAME" topology.kubernetes.io/zone=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null || echo "unknown") --overwrite 2>/dev/null || true
+""", ctx, strict=False)
+
+
+# ---------------------------------------------------------------------------
+# Helm + TiDB Operator
+# ---------------------------------------------------------------------------
 
 def install_helm(host: InstanceInfo, ctx: BootstrapContext):
     log(f"Installing Helm on {host.role}")
@@ -687,61 +936,6 @@ helm version || true
 """, ctx)
 
 
-def install_kind(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Installing kind on {host.role}")
-    ssh_run(host, f"""
-if command -v kind >/dev/null 2>&1; then
-    echo "kind already installed"
-    exit 0
-fi
-
-ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ]; then
-    ARCH="arm64"
-elif [ "$ARCH" = "x86_64" ]; then
-    ARCH="amd64"
-fi
-
-curl -Lo ./kind https://kind.sigs.k8s.io/dl/{KIND_VERSION}/kind-linux-$ARCH
-chmod +x ./kind
-sudo mv ./kind /usr/local/bin/kind
-kind version || true
-""", ctx)
-
-
-def create_kind_cluster(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Creating kind cluster on {host.role}")
-    ssh_run(host, """
-if kind get clusters 2>/dev/null | grep -q tidb-bench; then
-    echo "kind cluster 'tidb-bench' already exists"
-    exit 0
-fi
-
-cat <<'EOF' > /tmp/kind-config.yaml
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-- role: control-plane
-  extraPortMappings:
-  - containerPort: 30400
-    hostPort: 4000
-    protocol: TCP
-  - containerPort: 30080
-    hostPort: 10080
-    protocol: TCP
-  kubeadmConfigPatches:
-  - |
-    kind: InitConfiguration
-    nodeRegistration:
-      kubeletExtraArgs:
-        node-labels: "ingress-ready=true"
-EOF
-
-kind create cluster --name tidb-bench --config /tmp/kind-config.yaml --wait 5m
-kubectl cluster-info --context kind-tidb-bench
-""", ctx)
-
-
 def install_tidb_operator(host: InstanceInfo, ctx: BootstrapContext):
     log(f"Installing TiDB Operator {TIDB_OPERATOR_VERSION} on {host.role}")
     ssh_run(host, f"""
@@ -762,88 +956,154 @@ kubectl get pods --namespace tidb-admin -l app.kubernetes.io/instance=tidb-opera
 """, ctx)
 
 
+# ---------------------------------------------------------------------------
+# TiDB Cluster Deployment (with nodeSelector + tolerations for multi-node)
+# ---------------------------------------------------------------------------
+
 def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
-    log(f"Deploying TiDB cluster {ctx.tidb_version} on {host.role}")
-    
-    pd_config = "{}"
-    tikv_config = """
-      storage:
-        reserve-space: "0MB"
-      rocksdb:
-        max-open-files: 256
-      raftdb:
-        max-open-files: 256"""
-    
+    """Deploy TiDB cluster with nodeSelector/tolerations for dedicated hosts."""
+    log(f"Deploying TiDB cluster {ctx.tidb_version} with multi-node scheduling")
+
+    pd_config_block = ""
+    tikv_extra_config = ""
+
     if ctx.multi_az:
-        pd_config = """
-      replication:
-        location-labels:
-          - zone
-          - rack
-          - host
-        max-replicas: 3
-      enable-placement-rules: true"""
-        tikv_config = """
-      storage:
-        reserve-space: "0MB"
-      rocksdb:
-        max-open-files: 256
-      raftdb:
-        max-open-files: 256
-      server:
-        labels:
-          zone: "zone1"
-          rack: "rack1"
-          host: "host1" """
-    
+        pd_config_block = (
+            "      replication:\n"
+            "        location-labels:\n"
+            "          - zone\n"
+            "          - host\n"
+            "        max-replicas: 3\n"
+            "      enable-placement-rules: true"
+        )
+        tikv_extra_config = (
+            "      server:\n"
+            "        labels:\n"
+            "          zone: \"auto\"\n"
+            "          host: \"auto\""
+        )
+
+    # Build the YAML as a plain Python string (no f-string for the YAML body)
+    # to avoid brace-escaping issues with YAML/JSON syntax
+    yaml_lines = []
+    yaml_lines.append('apiVersion: pingcap.com/v1alpha1')
+    yaml_lines.append('kind: TidbCluster')
+    yaml_lines.append('metadata:')
+    yaml_lines.append('  name: basic')
+    yaml_lines.append('  namespace: tidb-cluster')
+    yaml_lines.append('spec:')
+    yaml_lines.append(f'  version: {ctx.tidb_version}')
+    yaml_lines.append('  timezone: UTC')
+    yaml_lines.append('  pvReclaimPolicy: Retain')
+    yaml_lines.append('  enableDynamicConfiguration: true')
+    yaml_lines.append('  configUpdateStrategy: RollingUpdate')
+    yaml_lines.append('  discovery: {}')
+    yaml_lines.append('  helper:')
+    yaml_lines.append('    image: alpine:3.16.0')
+    # PD
+    yaml_lines.append('  pd:')
+    yaml_lines.append('    baseImage: pingcap/pd')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append(f'    replicas: {ctx.pd_replicas}')
+    yaml_lines.append('    requests:')
+    yaml_lines.append('      storage: "10Gi"')
+    if pd_config_block:
+        yaml_lines.append('    config: |')
+        yaml_lines.append(pd_config_block)
+    else:
+        yaml_lines.append('    config: {}')
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/pd: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/pd')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('    affinity:')
+    yaml_lines.append('      podAntiAffinity:')
+    yaml_lines.append('        requiredDuringSchedulingIgnoredDuringExecution:')
+    yaml_lines.append('          - labelSelector:')
+    yaml_lines.append('              matchExpressions:')
+    yaml_lines.append('                - key: app.kubernetes.io/component')
+    yaml_lines.append('                  operator: In')
+    yaml_lines.append('                  values:')
+    yaml_lines.append('                    - pd')
+    yaml_lines.append('            topologyKey: kubernetes.io/hostname')
+    # TiKV
+    yaml_lines.append('  tikv:')
+    yaml_lines.append('    baseImage: pingcap/tikv')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append('    evictLeaderTimeout: 1m')
+    yaml_lines.append(f'    replicas: {ctx.tikv_replicas}')
+    yaml_lines.append('    requests:')
+    yaml_lines.append('      storage: "50Gi"')
+    yaml_lines.append('    config: |')
+    yaml_lines.append('      storage:')
+    yaml_lines.append('        reserve-space: "0MB"')
+    yaml_lines.append('      rocksdb:')
+    yaml_lines.append('        max-open-files: 256')
+    yaml_lines.append('      raftdb:')
+    yaml_lines.append('        max-open-files: 256')
+    if tikv_extra_config:
+        yaml_lines.append(tikv_extra_config)
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/tikv: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/tikv')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('    affinity:')
+    yaml_lines.append('      podAntiAffinity:')
+    yaml_lines.append('        requiredDuringSchedulingIgnoredDuringExecution:')
+    yaml_lines.append('          - labelSelector:')
+    yaml_lines.append('              matchExpressions:')
+    yaml_lines.append('                - key: app.kubernetes.io/component')
+    yaml_lines.append('                  operator: In')
+    yaml_lines.append('                  values:')
+    yaml_lines.append('                    - tikv')
+    yaml_lines.append('            topologyKey: kubernetes.io/hostname')
+    # TiDB
+    yaml_lines.append('  tidb:')
+    yaml_lines.append('    baseImage: pingcap/tidb')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append(f'    replicas: {ctx.tidb_replicas}')
+    yaml_lines.append('    service:')
+    yaml_lines.append('      type: NodePort')
+    yaml_lines.append('    config: {}')
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/tidb: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/tidb')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('    affinity:')
+    yaml_lines.append('      podAntiAffinity:')
+    yaml_lines.append('        preferredDuringSchedulingIgnoredDuringExecution:')
+    yaml_lines.append('          - weight: 100')
+    yaml_lines.append('            podAffinityTerm:')
+    yaml_lines.append('              labelSelector:')
+    yaml_lines.append('                matchExpressions:')
+    yaml_lines.append('                  - key: app.kubernetes.io/component')
+    yaml_lines.append('                    operator: In')
+    yaml_lines.append('                    values:')
+    yaml_lines.append('                      - tidb')
+    yaml_lines.append('              topologyKey: kubernetes.io/hostname')
+
+    yaml_str = '\n'.join(yaml_lines)
+
+    # Write YAML via base64 to avoid shell quoting issues
+    yaml_b64 = base64.b64encode(yaml_str.encode()).decode()
+
     ssh_run(host, f"""
 kubectl create namespace tidb-cluster || true
 
-cat <<'EOF' > /tmp/tidb-cluster.yaml
-apiVersion: pingcap.com/v1alpha1
-kind: TidbCluster
-metadata:
-  name: basic
-  namespace: tidb-cluster
-spec:
-  version: {ctx.tidb_version}
-  timezone: UTC
-  pvReclaimPolicy: Retain
-  enableDynamicConfiguration: true
-  configUpdateStrategy: RollingUpdate
-  discovery: {{}}
-  helper:
-    image: alpine:3.16.0
-  pd:
-    baseImage: pingcap/pd
-    maxFailoverCount: 0
-    replicas: {ctx.pd_replicas}
-    requests:
-      storage: "10Gi"
-    config: {pd_config}
-  tikv:
-    baseImage: pingcap/tikv
-    maxFailoverCount: 0
-    evictLeaderTimeout: 1m
-    replicas: {ctx.tikv_replicas}
-    requests:
-      storage: "50Gi"
-    config: {tikv_config}
-  tidb:
-    baseImage: pingcap/tidb
-    maxFailoverCount: 0
-    replicas: {ctx.tidb_replicas}
-    service:
-      type: NodePort
-    config: {{}}
-EOF
-
+echo '{yaml_b64}' | base64 -d > /tmp/tidb-cluster.yaml
 kubectl apply -f /tmp/tidb-cluster.yaml -n tidb-cluster
 
 echo "Waiting for TiDB service to be created..."
 for i in $(seq 1 30); do
     if kubectl get svc basic-tidb -n tidb-cluster >/dev/null 2>&1; then
-        kubectl patch svc basic-tidb -n tidb-cluster --type='json' -p='[{{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30400}}]' || true
+        kubectl patch svc basic-tidb -n tidb-cluster --type='json' \\
+            -p='[{{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30400}}]' || true
         break
     fi
     sleep 2
@@ -857,7 +1117,8 @@ def wait_for_tidb_ready(host: InstanceInfo, ctx: BootstrapContext):
 echo "Waiting for TiDB pods to be ready (this may take 5-10 minutes)..."
 
 for i in $(seq 1 60); do
-    READY=$(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=tidb -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+    READY=$(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=tidb \
+        -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
     if [ "$READY" = "true" ]; then
         echo "TiDB is ready!"
         break
@@ -871,32 +1132,49 @@ kubectl get pods -n tidb-cluster
 kubectl get svc -n tidb-cluster
 
 # Ensure NodePort is set correctly (operator may have reverted it)
-kubectl patch svc basic-tidb -n tidb-cluster --type='json' -p='[{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30400}]' 2>/dev/null || true
-echo "TiDB NodePort set to 30400 (mapped to host port 4000)"
+kubectl patch svc basic-tidb -n tidb-cluster --type='json' \
+    -p='[{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30400}]' 2>/dev/null || true
+echo "TiDB NodePort set to 30400"
 """, ctx, strict=False)
 
+
+# ---------------------------------------------------------------------------
+# Leader zone affinity
+# ---------------------------------------------------------------------------
 
 def configure_leader_zone_affinity(host: InstanceInfo, ctx: BootstrapContext):
     """Configure placement rules to prefer leaders in the client zone."""
     if not ctx.multi_az:
         log("Skipping leader zone affinity (single-AZ deployment)")
         return
-    
+
     log(f"Configuring leader zone affinity for zone: {ctx.client_zone}")
     zone_short = ctx.client_zone.split("-")[-1]
-    
+
+    # Find TiDB node IP to connect through NodePort
+    tidb_ip = ctx.tidb_nodes[0].private_ip if ctx.tidb_nodes else "127.0.0.1"
+
     ssh_run(host, f"""
+# Get the TiDB NodePort service cluster IP or use node IP
+TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.clusterIP}}' 2>/dev/null || echo "")
+TIDB_PORT=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.ports[0].port}}' 2>/dev/null || echo "4000")
+
+if [ -z "$TIDB_HOST" ]; then
+    TIDB_HOST="{tidb_ip}"
+    TIDB_PORT="30400"
+fi
+
 for i in $(seq 1 30); do
-    if mysql -h 127.0.0.1 -P {TIDB_PORT} -u root -e "SELECT 1" 2>/dev/null; then
+    if mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SELECT 1" 2>/dev/null; then
         break
     fi
     echo "Waiting for TiDB connection... (attempt $i/30)"
     sleep 5
 done
 
-mysql -h 127.0.0.1 -P {TIDB_PORT} -u root -e "
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "
 -- Create placement policy preferring leaders in client zone
-CREATE PLACEMENT POLICY IF NOT EXISTS local_leader 
+CREATE PLACEMENT POLICY IF NOT EXISTS local_leader
   LEADER_CONSTRAINTS='[+zone={zone_short}]'
   FOLLOWER_CONSTRAINTS='{{\\"+zone={zone_short}\\": 1}}';
 
@@ -905,6 +1183,10 @@ SHOW PLACEMENT;
 " 2>/dev/null || echo "Note: Placement rules require TiDB 5.2+ and enabled placement-rules"
 """, ctx, strict=False)
 
+
+# ---------------------------------------------------------------------------
+# Client Tools (only on client node)
+# ---------------------------------------------------------------------------
 
 def install_mysql_client(host: InstanceInfo, ctx: BootstrapContext):
     log(f"Installing MySQL client on {host.role}")
@@ -964,33 +1246,67 @@ sysbench --version
 
 
 def create_sysbench_database(host: InstanceInfo, ctx: BootstrapContext):
+    """Create the sysbench database via the TiDB service in k8s."""
     log("Creating sysbench database...")
+
+    # Get the TiDB NodePort IP (use first TiDB node IP with NodePort 30400)
+    tidb_ip = ctx.tidb_nodes[0].private_ip if ctx.tidb_nodes else "127.0.0.1"
+
     ssh_run(host, f"""
+# Determine TiDB connection endpoint
+TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.clusterIP}}' 2>/dev/null || echo "")
+TIDB_PORT=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.ports[0].port}}' 2>/dev/null || echo "4000")
+
+if [ -z "$TIDB_HOST" ]; then
+    TIDB_HOST="{tidb_ip}"
+    TIDB_PORT="30400"
+fi
+
 for i in $(seq 1 30); do
-    if mysql -h 127.0.0.1 -P {TIDB_PORT} -u root -e "SELECT 1" 2>/dev/null; then
+    if mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SELECT 1" 2>/dev/null; then
         break
     fi
     echo "Waiting for TiDB connection... (attempt $i/30)"
     sleep 5
 done
 
-mysql -h 127.0.0.1 -P {TIDB_PORT} -u root -e "CREATE DATABASE IF NOT EXISTS sbtest;"
-mysql -h 127.0.0.1 -P {TIDB_PORT} -u root -e "SHOW DATABASES;"
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "CREATE DATABASE IF NOT EXISTS sbtest;"
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SHOW DATABASES;"
+
+# Disable resource control to avoid error 8249 (Unknown resource group 'default')
+# Resource control is not needed for benchmarking and causes sysbench FATAL errors
+mysql -h "$TIDB_HOST" -P "$TIDB_PORT" -u root -e "SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+echo "Resource control disabled"
 """, ctx)
 
 
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
 def terminate_stack_instances():
-    name = f"{STACK}-host"
-    iid = find_instance_id_by_name(name)
-    if iid:
-        log(f"TERMINATING instance: {iid}")
-        try:
-            ec2().terminate_instances(InstanceIds=[iid])
-            waiter = ec2().get_waiter("instance_terminated")
-            waiter.wait(InstanceIds=[iid])
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] != "InvalidInstanceID.NotFound":
-                raise
+    """Terminate all EC2 instances belonging to this stack."""
+    instances = find_all_stack_instances()
+    if not instances:
+        log("No stack instances found to terminate.")
+        return
+
+    ids_to_terminate = [inst["id"] for inst in instances if inst["state"] not in ("terminated", "shutting-down")]
+    if not ids_to_terminate:
+        log("All instances already terminated.")
+        return
+
+    for inst in instances:
+        if inst["id"] in ids_to_terminate:
+            log(f"TERMINATING instance {inst['role']} ({inst['name']}): {inst['id']}")
+
+    try:
+        ec2().terminate_instances(InstanceIds=ids_to_terminate)
+        waiter = ec2().get_waiter("instance_terminated")
+        waiter.wait(InstanceIds=ids_to_terminate)
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidInstanceID.NotFound":
+            raise
 
 
 def delete_stack_security_groups():
@@ -1089,6 +1405,27 @@ def cleanup_stack():
     log("Cleanup complete.")
 
 
+# ---------------------------------------------------------------------------
+# Wait for SSH on multiple nodes
+# ---------------------------------------------------------------------------
+
+def wait_for_ssh(node: InstanceInfo, ctx: BootstrapContext, max_attempts=30):
+    """Wait for SSH to become available on a node."""
+    for attempt in range(max_attempts):
+        result = ssh_capture(node, "echo ready", ctx, strict=False)
+        if result.returncode == 0:
+            return True
+        if attempt < max_attempts - 1:
+            log(f"  {node.role} ({node.public_ip}) not ready yet (attempt {attempt + 1}/{max_attempts})...")
+            time.sleep(10)
+    log(f"  WARNING: {node.role} ({node.public_ip}) did not become reachable after {max_attempts} attempts")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = parse_args()
     args = parser.parse_args()
@@ -1106,47 +1443,14 @@ def main():
     self_cidr = args.ssh_cidr or my_public_cidr()
     log(f"Using SSH CIDR: {self_cidr}")
     log(f"Using TiDB version: {args.tidb_version}")
-    log(f"Using instance type: {args.instance_type}")
-    if args.multi_az:
-        log(f"Multi-AZ deployment enabled (client zone: {args.client_zone})")
-    if args.production:
-        log("Using PingCAP production instance type recommendations")
-
-    log("=== Provisioning Network ===")
-    vpc_id = ensure_vpc()
-    igw_id = ensure_igw(vpc_id)
-    public_subnet = ensure_subnet(vpc_id, f"{STACK}-public", PUB_CIDR, public=True)
-    ensure_public_rtb(vpc_id, igw_id, public_subnet)
-
-    log("=== Provisioning Security Group ===")
-    sg_host = ensure_sg(vpc_id, f"{STACK}-host", "TiDB load test host")
-    refresh_ssh_rule(sg_host, self_cidr)
-    ensure_ingress_tcp_cidr(sg_host, TIDB_PORT, self_cidr)
-
-    log("=== Provisioning Instance ===")
-    host_id = ensure_instance(f"{STACK}-host", "host", args.instance_type, public_subnet, sg_host)
-
-    log("=== Gathering Instance Information ===")
-    time.sleep(10)
-    inst = describe_instance(host_id)
-    host = InstanceInfo(
-        role="host",
-        instance_id=host_id,
-        public_ip=inst.get("PublicIpAddress"),
-        private_ip=inst.get("PrivateIpAddress"),
-    )
-    log(f"  host: public={host.public_ip} private={host.private_ip}")
-
-    if args.skip_bootstrap:
-        log("Skipping bootstrap (--skip-bootstrap). Infrastructure ready.")
-        log(f"SSH: ssh -i {key_path} ec2-user@{host.public_ip}")
-        return
 
     multi_az = args.multi_az and not args.single_az
+    production = args.production and not args.benchmark_mode
+
     pd_replicas = args.pd_replicas
     tikv_replicas = args.tikv_replicas
     tidb_replicas = args.tidb_replicas
-    
+
     if args.single_az:
         pd_replicas = 1
         tikv_replicas = 1
@@ -1155,69 +1459,159 @@ def main():
     else:
         log(f"Multi-AZ mode: PD={pd_replicas}, TiKV={tikv_replicas}, TiDB={tidb_replicas}")
 
+    types = PRODUCTION_INSTANCE_TYPES if production else BENCHMARK_INSTANCE_TYPES
+    log(f"Instance types: PD={types['pd']}, TiKV={types['tikv']}, TiDB={types['tidb']}, Client={types['client']}")
+
+    # -----------------------------------------------------------------------
+    # Network
+    # -----------------------------------------------------------------------
+    log("=== Provisioning Network ===")
+    vpc_id = ensure_vpc()
+    igw_id = ensure_igw(vpc_id)
+    # Single subnet (all nodes in same subnet for simplicity & minimal latency)
+    public_subnet = ensure_subnet(vpc_id, f"{STACK}-public", PUB_CIDR, az=args.client_zone, public=True)
+    ensure_public_rtb(vpc_id, igw_id, public_subnet)
+
+    # -----------------------------------------------------------------------
+    # Security Group
+    # -----------------------------------------------------------------------
+    log("=== Provisioning Security Group ===")
+    sg = ensure_sg(vpc_id, f"{STACK}-cluster", "TiDB load test cluster (multi-node)")
+    refresh_ssh_rule(sg, self_cidr)
+    ensure_ingress_tcp_cidr(sg, TIDB_PORT, self_cidr)
+    ensure_intra_cluster_rules(sg)  # All traffic within the cluster
+
+    # -----------------------------------------------------------------------
+    # EC2 Instances
+    # -----------------------------------------------------------------------
+    log("=== Provisioning EC2 Instances ===")
+    client_type = types["client"]
+    client_vol = ROOT_VOLUME_SIZES["client"]
+    client_id = ensure_instance(f"{STACK}-client", "client", client_type, public_subnet, sg, client_vol)
+
+    pd_ids = provision_role_instances("pd", pd_replicas, types, public_subnet, sg, production)
+    tikv_ids = provision_role_instances("tikv", tikv_replicas, types, public_subnet, sg, production)
+    tidb_ids = provision_role_instances("tidb", tidb_replicas, types, public_subnet, sg, production)
+
+    # -----------------------------------------------------------------------
+    # Gather Instance Information
+    # -----------------------------------------------------------------------
+    log("=== Gathering Instance Information ===")
+    time.sleep(10)  # Allow public IPs to propagate
+
+    client = instance_info_from_id(client_id, "client")
+    pd_nodes = [instance_info_from_id(iid, f"pd-{i+1}") for i, iid in enumerate(pd_ids)]
+    tikv_nodes = [instance_info_from_id(iid, f"tikv-{i+1}") for i, iid in enumerate(tikv_ids)]
+    tidb_nodes = [instance_info_from_id(iid, f"tidb-{i+1}") for i, iid in enumerate(tidb_ids)]
+
+    log(f"  client:  public={client.public_ip} private={client.private_ip}")
+    for n in pd_nodes:
+        log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
+    for n in tikv_nodes:
+        log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
+    for n in tidb_nodes:
+        log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
+
+    total_instances = 1 + len(pd_nodes) + len(tikv_nodes) + len(tidb_nodes)
+    log(f"  Total instances: {total_instances}")
+
+    if args.skip_bootstrap:
+        log("Skipping bootstrap (--skip-bootstrap). Infrastructure ready.")
+        log(f"SSH to client: ssh -i {key_path} ec2-user@{client.public_ip}")
+        return
+
+    # -----------------------------------------------------------------------
+    # Build context
+    # -----------------------------------------------------------------------
     ctx = BootstrapContext(
         ssh_key_path=key_path,
         self_cidr=self_cidr,
-        host=host,
+        client=client,
+        pd_nodes=pd_nodes,
+        tikv_nodes=tikv_nodes,
+        tidb_nodes=tidb_nodes,
         tidb_version=args.tidb_version,
         pd_replicas=pd_replicas,
         tikv_replicas=tikv_replicas,
         tidb_replicas=tidb_replicas,
         multi_az=multi_az,
-        production=args.production and not args.benchmark_mode,
+        production=production,
         client_zone=args.client_zone,
     )
 
-    log("=== Waiting for instance to be ready ===")
-    for attempt in range(30):
-        result = ssh_capture(host, "echo ready", ctx, strict=False)
-        if result.returncode == 0:
-            break
-        log(f"Instance not ready yet (attempt {attempt + 1}/30)...")
-        time.sleep(10)
+    # -----------------------------------------------------------------------
+    # Wait for SSH on all nodes
+    # -----------------------------------------------------------------------
+    log("=== Waiting for SSH on all nodes ===")
+    for node in ctx.all_nodes:
+        wait_for_ssh(node, ctx)
 
-    log("=== Installing Prerequisites ===")
-    install_docker(host, ctx)
-    install_kubectl(host, ctx)
-    install_helm(host, ctx)
-    install_kind(host, ctx)
+    # -----------------------------------------------------------------------
+    # Install base packages on all nodes
+    # -----------------------------------------------------------------------
+    log("=== Installing Base Packages ===")
+    for node in ctx.all_nodes:
+        install_base_packages(node, ctx)
 
-    log("=== Creating kind Cluster ===")
-    create_kind_cluster(host, ctx)
+    # -----------------------------------------------------------------------
+    # k3s Cluster Setup
+    # -----------------------------------------------------------------------
+    log("=== Setting up k3s Cluster ===")
+    install_k3s_server(client, ctx)
+    k3s_token = get_k3s_token(client, ctx)
+    log(f"k3s token retrieved (length={len(k3s_token)})")
+
+    log("=== Joining k3s Agent Nodes ===")
+    for node in ctx.all_agent_nodes:
+        install_k3s_agent(node, client.private_ip, k3s_token, ctx)
+
+    log("=== Labeling and Tainting Nodes ===")
+    label_and_taint_nodes(ctx)
+
+    # -----------------------------------------------------------------------
+    # TiDB Operator + Cluster
+    # -----------------------------------------------------------------------
+    log("=== Installing Helm ===")
+    install_helm(client, ctx)
 
     log("=== Installing TiDB Operator ===")
-    install_tidb_operator(host, ctx)
+    install_tidb_operator(client, ctx)
 
     log("=== Deploying TiDB Cluster ===")
-    deploy_tidb_cluster(host, ctx)
-    wait_for_tidb_ready(host, ctx)
+    deploy_tidb_cluster(client, ctx)
+    wait_for_tidb_ready(client, ctx)
 
+    # -----------------------------------------------------------------------
+    # Client Tools
+    # -----------------------------------------------------------------------
     log("=== Installing Client Tools ===")
-    install_mysql_client(host, ctx)
-    install_sysbench(host, ctx)
-    create_sysbench_database(host, ctx)
+    install_mysql_client(client, ctx)
+    install_sysbench(client, ctx)
+    create_sysbench_database(client, ctx)
 
     if ctx.multi_az:
         log("=== Configuring Leader Zone Affinity ===")
-        configure_leader_zone_affinity(host, ctx)
+        configure_leader_zone_affinity(client, ctx)
 
+    # -----------------------------------------------------------------------
+    # Done
+    # -----------------------------------------------------------------------
     log("=== Deployment Complete ===")
-    log(f"")
-    log(f"SSH to host: ssh -i {key_path} ec2-user@{host.public_ip}")
-    log(f"")
-    log(f"TiDB is accessible at: {host.public_ip}:{TIDB_PORT}")
-    log(f"")
-    log("From the host, connect to TiDB:")
-    log(f"  mysql -h 127.0.0.1 -P {TIDB_PORT} -u root")
     log("")
-    log("To run sysbench prepare:")
-    log(f"  sysbench oltp_read_write --mysql-host=127.0.0.1 --mysql-port={TIDB_PORT} --mysql-user=root --mysql-db=sbtest --tables=16 --table-size=100000 prepare")
+    log(f"SSH to client: ssh -i {key_path} ec2-user@{client.public_ip}")
     log("")
-    log("To run sysbench benchmark:")
-    log(f"  sysbench oltp_read_write --mysql-host=127.0.0.1 --mysql-port={TIDB_PORT} --mysql-user=root --mysql-db=sbtest --tables=16 --table-size=100000 --threads=64 --time=120 run")
+
+    # Determine TiDB endpoint for the user
+    tidb_node_ip = tidb_nodes[0].public_ip if tidb_nodes else client.public_ip
+    log(f"TiDB accessible via NodePort: {tidb_node_ip}:30400")
+    log("")
+    log("From the client host, connect to TiDB:")
+    log(f"  TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{{.spec.clusterIP}}')")
+    log(f"  mysql -h $TIDB_HOST -P 4000 -u root")
     log("")
     log("To check cluster status:")
-    log("  kubectl get pods -n tidb-cluster")
+    log("  kubectl get nodes -o wide")
+    log("  kubectl get pods -n tidb-cluster -o wide")
     log("  kubectl get tc -n tidb-cluster")
 
 
