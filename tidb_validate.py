@@ -52,7 +52,7 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> dict:
         for inst in reservation.get("Instances", []):
             tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
             role = tags.get("Role", "")
-            if role == "host":
+            if role in ("host", "client"):
                 return {
                     "instance_id": inst["InstanceId"],
                     "public_ip": inst.get("PublicIpAddress"),
@@ -107,15 +107,16 @@ def check_ssh_connectivity(host: str, key_path: Path) -> bool:
     return result.returncode == 0 and "ok" in result.stdout
 
 
-def check_docker(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, "docker ps >/dev/null 2>&1 && echo ok", key_path)
+def check_k3s(host: str, key_path: Path) -> bool:
+    """Check if k3s is running (replaces Docker check)."""
+    result = ssh_capture(host, "sudo systemctl is-active k3s >/dev/null 2>&1 && echo ok", key_path)
     return result.returncode == 0 and "ok" in result.stdout
 
 
-def check_kind_cluster(host: str, key_path: Path) -> bool:
-    result = ssh_capture(host, "kind get clusters 2>/dev/null | grep -q tidb-bench && echo ok", key_path)
+def check_k3s_cluster(host: str, key_path: Path) -> bool:
+    """Check if k3s cluster has nodes (replaces kind check)."""
+    result = ssh_capture(host, "kubectl get nodes --no-headers 2>/dev/null | wc -l | xargs test 0 -lt && echo ok", key_path)
     return result.returncode == 0 and "ok" in result.stdout
-
 
 def check_kubectl(host: str, key_path: Path) -> bool:
     result = ssh_capture(host, "kubectl cluster-info >/dev/null 2>&1 && echo ok", key_path)
@@ -338,15 +339,15 @@ def main():
         log("FAIL: Cannot connect to host via SSH")
         raise SystemExit("Validation failed: SSH connectivity")
     
-    docker_ok = check_docker(host, key_path)
-    checks.append(("Docker", docker_ok))
-    log(f"  Docker Running: {'PASS' if docker_ok else 'FAIL'}")
+    k3s_ok = check_k3s(host, key_path)
+    checks.append(("k3s Service", k3s_ok))
+    log(f"  k3s Service: {'PASS' if k3s_ok else 'FAIL'}")
     
     log("\n--- Kubernetes Cluster ---")
     
-    kind_ok = check_kind_cluster(host, key_path)
-    checks.append(("kind Cluster", kind_ok))
-    log(f"  kind Cluster: {'PASS' if kind_ok else 'FAIL'}")
+    cluster_ok = check_k3s_cluster(host, key_path)
+    checks.append(("k3s Cluster", cluster_ok))
+    log(f"  k3s Cluster: {'PASS' if cluster_ok else 'FAIL'}")
     
     kubectl_ok = check_kubectl(host, key_path)
     checks.append(("kubectl", kubectl_ok))

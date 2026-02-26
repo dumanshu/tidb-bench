@@ -64,7 +64,8 @@ SESSION_VARS_READ_ONLY = (
 
 # MySQL errors to ignore during benchmark (improves resilience)
 # 1213: Deadlock, 1020: Record changed, 1205: Lock wait timeout, 1105: Deadline exceeded
-MYSQL_IGNORE_ERRORS = "1213,1020,1205,1105"
+# 8249: Unknown resource group (TiDB resource control interference)
+MYSQL_IGNORE_ERRORS = "1213,1020,1205,1105,8249"
 
 # AWS cost estimates (us-east-1, on-demand pricing as of 2024)
 # Sources: https://aws.amazon.com/ec2/pricing/on-demand/
@@ -338,7 +339,7 @@ def ec2_client(profile: Optional[str], region: str):
 
 
 def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
-    """Discover the TiDB host instance public IP."""
+    """Discover the TiDB client/host instance public IP."""
     client = ec2_client(profile, region)
     stack = f"tidb-loadtest-{seed}"
     filters = [
@@ -350,7 +351,8 @@ def discover_tidb_host(region: str, profile: Optional[str], seed: str) -> str:
         for inst in reservation.get("Instances", []):
             tags = {tag["Key"]: tag["Value"] for tag in inst.get("Tags", [])}
             role = tags.get("Role", "")
-            if role == "host":
+            # Support both old single-node ("host") and new multi-node ("client") layouts
+            if role in ("host", "client"):
                 ip = inst.get("PublicIpAddress")
                 if ip:
                     return ip
@@ -480,31 +482,45 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"Regions: {cluster_info.get('region_count', 'N/A')}")
     log("")
     
-    # Determine instance type
-    host_type = "c7g.4xlarge"  # Default (updated to larger instance)
+    # Build per-role instance type map from actual EC2 tags
+    role_types = {}
     for inst in inst_info.get("instances", []):
-        inst_type = inst.get("type")
-        if inst_type:
-            host_type = inst_type
-            break
+        role = inst.get("role", "unknown")
+        itype = inst.get("type", "unknown")
+        # Normalize role names: pd-1 -> pd, tikv-2 -> tikv, etc.
+        base_role = role.rsplit("-", 1)[0] if "-" in role else role
+        if base_role not in role_types:
+            role_types[base_role] = itype
     
-    host_specs = AWS_COSTS["ec2"].get(host_type, {"vcpu": 16, "memory_gb": 32})
+    # Fallback: if old single-node layout, use "host" type for all
+    default_type = role_types.get("host", role_types.get("client", "c7g.4xlarge"))
+    tidb_type = role_types.get("tidb", default_type)
+    tikv_type = role_types.get("tikv", default_type)
+    pd_type = role_types.get("pd", default_type)
+    client_type = role_types.get("client", role_types.get("host", default_type))
+    
+    def specs(itype):
+        return AWS_COSTS["ec2"].get(itype, {"vcpu": "?", "memory_gb": "?", "hourly": 0.0})
     
     # Compute resources table
     log("--- Compute Resources ---")
     log(f"{'Component':<12} {'Count':>6} {'Instance':>14} {'vCPU':>6} {'Memory':>8}")
     log("-" * 52)
-    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
-    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
-    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
-    log(f"{'Client (EC2)':<12} {'1':>6} {host_type:>14} {host_specs.get('vcpu', 16):>6} {host_specs.get('memory_gb', 32):>6}GB")
+    ts_ = specs(tidb_type)
+    ks_ = specs(tikv_type)
+    ps_ = specs(pd_type)
+    cs_ = specs(client_type)
+    log(f"{'TiDB':<12} {cluster_info.get('tidb_count', 2):>6} {tidb_type:>14} {ts_.get('vcpu', '?'):>6} {ts_.get('memory_gb', '?'):>5}GB")
+    log(f"{'TiKV':<12} {cluster_info.get('tikv_count', 3):>6} {tikv_type:>14} {ks_.get('vcpu', '?'):>6} {ks_.get('memory_gb', '?'):>5}GB")
+    log(f"{'PD':<12} {cluster_info.get('pd_count', 3):>6} {pd_type:>14} {ps_.get('vcpu', '?'):>6} {ps_.get('memory_gb', '?'):>5}GB")
+    log(f"{'Client (EC2)':<12} {'1':>6} {client_type:>14} {cs_.get('vcpu', '?'):>6} {cs_.get('memory_gb', '?'):>5}GB")
     server_count = (cluster_info.get('tidb_count', 2) +
                     cluster_info.get('tikv_count', 3) +
                     cluster_info.get('pd_count', 3))
     log(f"  Total server hosts: {server_count} (each pod on its own dedicated host)")
     log("")
     
-    # EBS storage details (per TiKV node — each node has its own EBS volume)
+    # EBS storage details (per TiKV node - each node has its own EBS volume)
     # Auto-detect EBS size from host filesystem rather than hardcoding
     disk_info = get_disk_utilization(host, key_path, port, DEFAULT_EBS_SIZE_GB)
     ebs_type = "gp3"
@@ -528,14 +544,18 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"Same-AZ transfer:  ${AWS_COSTS['network']['same_az_per_gb']:.3f}/GB (free)")
     log("")
     
-    # Quick cost preview
-    hourly_compute = AWS_COSTS["ec2"].get(host_type, {}).get("hourly", 0.58) * server_count
+    # Quick cost preview (per-role compute costs)
+    hourly_compute = (
+        specs(tidb_type).get("hourly", 0.0) * cluster_info.get('tidb_count', 2) +
+        specs(tikv_type).get("hourly", 0.0) * cluster_info.get('tikv_count', 3) +
+        specs(pd_type).get("hourly", 0.0) * cluster_info.get('pd_count', 3) +
+        specs(client_type).get("hourly", 0.0)
+    )
     hourly_storage = ebs_monthly / 730
     total_hourly = hourly_compute + hourly_storage
     log(f"--- Hourly Rate Preview ({server_count} server hosts + 1 client) ---")
     log(f"EC2 Compute: ${hourly_compute:.3f}/hr | EBS Storage: ${hourly_storage:.4f}/hr | Total: ${total_hourly:.3f}/hr")
     log("=" * 80)
-
 
 def start_resource_monitor(host: str, key_path: Path, interval: int = 60, 
                           cost_tracker: Optional['CostTracker'] = None,
@@ -1855,18 +1875,29 @@ def _run_benchmark(args):
     # Print cluster summary and get instance info for cost tracking
     print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
 
+    # Pre-flight: disable resource control to avoid error 8249
+    log("Disabling TiDB resource control (avoids error 8249)...")
+    ssh_run(host, f"""
+mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_control = OFF;" 2>/dev/null || true
+""", key_path, strict=False)
+
+
     # Initialize cost tracker
     cost_tracker = CostTracker(region=args.region)
     inst_info = get_instance_info(args.region, args.aws_profile, args.seed)
 
-    # Determine instance types
-    client_type = "c7g.2xlarge"  # Default
-    server_type = "c7g.2xlarge"  # Default
+    # Determine instance types per role
+    role_types = {}
     for inst in inst_info.get("instances", []):
-        if inst.get("type"):
-            client_type = inst.get("type")
-            server_type = inst.get("type")
-            break
+        role = inst.get("role", "unknown")
+        itype = inst.get("type", "")
+        base_role = role.rsplit("-", 1)[0] if "-" in role else role
+        if base_role not in role_types and itype:
+            role_types[base_role] = itype
+    default_type = role_types.get("host", role_types.get("client", "c7g.4xlarge"))
+    client_type = role_types.get("client", role_types.get("host", default_type))
+    # For cost tracking, use the most expensive server type (tikv typically)
+    server_type = role_types.get("tikv", default_type)
 
     # Get cluster info for pod count
     cluster_info = get_cluster_info(host, key_path, args.port)
