@@ -267,17 +267,16 @@ class CostTracker:
         log("=" * 70)
 
 class CdcLagTracker:
-    """Measure TiCDC replication lag using injected timestamps.
+    """Measure TiCDC replication lag via DB-side timestamps.
 
-    A writer thread INSERTs rows with monotonically increasing sequence
-    numbers into ``cdc_test.lag_tracker`` on the upstream cluster and
-    records the local wall-clock time of each write.  A reader thread
-    polls the downstream cluster for newly replicated rows and computes
-    the lag as ``local_read_time - local_write_time`` for each row.
+    Upstream table has src_write_ts DEFAULT CURRENT_TIMESTAMP(6).
+    After TiCDC replicates the table, we ALTER the downstream copy to
+    add dst_write_ts DEFAULT CURRENT_TIMESTAMP(6).  Since this column
+    does not exist upstream, TiCDC won't send a value for it -- the
+    downstream DEFAULT fires on each replicated INSERT.
 
-    All timing is performed on the client machine, so clock skew between
-    the upstream and downstream database hosts does not affect results.
-    The ``src_write_ts`` column stored in the row is an audit field only.
+    Lag per row = dst_write_ts - src_write_ts.
+    All rows use monotonically increasing seq (INSERT-only, no updates).
     """
 
     MAX_LAG_THRESHOLD = 120.0
@@ -305,8 +304,6 @@ class CdcLagTracker:
         self._writer_thread: Optional[threading.Thread] = None
         self._reader_thread: Optional[threading.Thread] = None
 
-        self._pending: dict[int, float] = {}
-        self._pending_lock = threading.Lock()
         self._seq = 0
         self._last_read_seq = 0
 
@@ -318,12 +315,24 @@ mysql -h "$UPSTREAM_IP" -P 4000 -u root -e "
   CREATE DATABASE IF NOT EXISTS cdc_test;
   DROP TABLE IF EXISTS cdc_test.lag_tracker;
   CREATE TABLE cdc_test.lag_tracker (
-      seq       INT NOT NULL PRIMARY KEY,
+      seq          INT NOT NULL PRIMARY KEY,
       src_write_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
   );
 "
 """
         ssh_run(self.host, script, self.key_path, strict=False)
+
+    def _add_dst_column(self):
+        script = f"""
+DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} \
+  -o jsonpath='{{.spec.clusterIP}}')
+mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -e "
+  ALTER TABLE cdc_test.lag_tracker
+    ADD COLUMN dst_write_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6);
+" 2>/dev/null && echo "OK"
+"""
+        result = ssh_capture(self.host, script, self.key_path)
+        return "OK" in result.stdout
 
     def _write_row(self) -> Optional[int]:
         self._seq += 1
@@ -340,29 +349,32 @@ mysql -h "$UPSTREAM_IP" -P 4000 -u root -N -e \
             return seq
         return None
 
-    def _read_new_rows(self) -> list[int]:
+    def _read_new_rows(self) -> list[tuple[int, float]]:
         script = f"""
 DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} \
   -o jsonpath='{{.spec.clusterIP}}')
 mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
-  "SELECT seq FROM cdc_test.lag_tracker WHERE seq > {self._last_read_seq} ORDER BY seq;" 2>/dev/null
+  "SELECT seq, TIMESTAMPDIFF(MICROSECOND, src_write_ts, dst_write_ts) / 1000000.0 AS lag_s \
+   FROM cdc_test.lag_tracker \
+   WHERE seq > {self._last_read_seq} ORDER BY seq;" 2>/dev/null
 """
         result = ssh_capture(self.host, script, self.key_path)
-        seqs: list[int] = []
+        rows: list[tuple[int, float]] = []
         for line in result.stdout.strip().split('\n'):
-            line = line.strip()
-            if line.isdigit():
-                seqs.append(int(line))
-        return seqs
+            parts = line.strip().split()
+            if len(parts) == 2:
+                try:
+                    seq = int(parts[0])
+                    lag = float(parts[1])
+                    rows.append((seq, lag))
+                except (ValueError, IndexError):
+                    pass
+        return rows
 
     def _writer_loop(self):
         while not self._stop.is_set():
             try:
-                t_before = time.monotonic()
-                seq = self._write_row()
-                if seq is not None:
-                    with self._pending_lock:
-                        self._pending[seq] = t_before
+                self._write_row()
             except Exception:
                 pass
             self._stop.wait(self.write_interval)
@@ -370,16 +382,12 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
     def _reader_loop(self):
         while not self._stop.is_set():
             try:
-                t_read = time.monotonic()
-                new_seqs = self._read_new_rows()
-                if new_seqs:
-                    with self._pending_lock:
-                        for seq in new_seqs:
-                            if seq in self._pending:
-                                lag = t_read - self._pending.pop(seq)
-                                if 0 <= lag < self.MAX_LAG_THRESHOLD:
-                                    self._samples.append(lag)
-                    self._last_read_seq = max(new_seqs)
+                new_rows = self._read_new_rows()
+                if new_rows:
+                    for seq, lag in new_rows:
+                        if 0 <= lag < self.MAX_LAG_THRESHOLD:
+                            self._samples.append(lag)
+                    self._last_read_seq = max(seq for seq, _ in new_rows)
             except Exception:
                 pass
             self._stop.wait(self.read_interval)
@@ -394,19 +402,34 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
             log("  CDC lag tracker warmup: failed to write seed row")
             return
 
-        write_time = time.monotonic()
-        max_wait = 30
+        max_wait = 60
         start = time.time()
+        arrived = False
         while time.time() - start < max_wait:
-            time.sleep(1)
-            arrived = self._read_new_rows()
-            if seq in arrived:
-                lag = time.monotonic() - write_time
-                self._last_read_seq = seq
-                log(f"  CDC lag tracker warmed up (seed row lag: {lag:.1f}s)")
-                return
-        log("  CDC lag tracker warmup timed out; collecting samples anyway")
+            time.sleep(2)
+            script = f"""
+DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} \
+  -o jsonpath='{{.spec.clusterIP}}')
+mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
+  "SELECT seq FROM cdc_test.lag_tracker WHERE seq = {seq};" 2>/dev/null
+"""
+            result = ssh_capture(self.host, script, self.key_path)
+            if str(seq) in result.stdout:
+                arrived = True
+                break
+
+        if not arrived:
+            log("  CDC lag tracker warmup timed out waiting for seed row")
+            self._last_read_seq = seq
+            return
+
+        if self._add_dst_column():
+            log("  Added dst_write_ts column on downstream table")
+        else:
+            log("  WARNING: failed to add dst_write_ts column on downstream")
+
         self._last_read_seq = seq
+        log(f"  CDC lag tracker warmed up (seed row seq={seq})")
 
     def start(self):
         log("Starting TiCDC lag tracker...")
@@ -448,7 +471,7 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
             return
         log("")
         log("=" * 70)
-        log("TICDC REPLICATION LAG")
+        log("TICDC REPLICATION LAG  (dst_write_ts - src_write_ts)")
         log("=" * 70)
         log(f"Samples: {data['samples']}")
         log(f"  Min:  {data['min']:.3f}s")
