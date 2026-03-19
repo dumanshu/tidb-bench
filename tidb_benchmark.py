@@ -267,9 +267,19 @@ class CostTracker:
         log("=" * 70)
 
 class CdcLagTracker:
-    # Discard any lag sample exceeding this threshold (seconds).  Stale
-    # downstream heartbeat rows from prior sessions can produce spurious
-    # values in the tens-of-thousands of seconds.
+    """Measure TiCDC replication lag using injected timestamps.
+
+    A writer thread INSERTs rows with monotonically increasing sequence
+    numbers into ``cdc_test.lag_tracker`` on the upstream cluster and
+    records the local wall-clock time of each write.  A reader thread
+    polls the downstream cluster for newly replicated rows and computes
+    the lag as ``local_read_time - local_write_time`` for each row.
+
+    All timing is performed on the client machine, so clock skew between
+    the upstream and downstream database hosts does not affect results.
+    The ``src_write_ts`` column stored in the row is an audit field only.
+    """
+
     MAX_LAG_THRESHOLD = 120.0
 
     def __init__(self, host: str, key_path: Path,
@@ -278,7 +288,8 @@ class CdcLagTracker:
                  downstream_svc: str = "downstream-tidb",
                  downstream_ns: str = "tidb-downstream",
                  downstream_port: int = INTERNAL_SERVICE_PORT,
-                 interval: float = 1.0):
+                 write_interval: float = 0.5,
+                 read_interval: float = 0.5):
         self.host = host
         self.key_path = key_path
         self.upstream_svc = upstream_svc
@@ -286,71 +297,133 @@ class CdcLagTracker:
         self.downstream_svc = downstream_svc
         self.downstream_ns = downstream_ns
         self.downstream_port = downstream_port
-        self.interval = interval
+        self.write_interval = write_interval
+        self.read_interval = read_interval
+
         self._samples: list[float] = []
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._writer_thread: Optional[threading.Thread] = None
+        self._reader_thread: Optional[threading.Thread] = None
 
-    def _measure(self):
+        self._pending: dict[int, float] = {}
+        self._pending_lock = threading.Lock()
+        self._seq = 0
+        self._last_read_seq = 0
+
+    def _init_table(self):
         script = f"""
-UPSTREAM_IP=$(kubectl get svc {self.upstream_svc} -n {self.upstream_ns} -o jsonpath='{{.spec.clusterIP}}')
-DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} -o jsonpath='{{.spec.clusterIP}}')
+UPSTREAM_IP=$(kubectl get svc {self.upstream_svc} -n {self.upstream_ns} \
+  -o jsonpath='{{.spec.clusterIP}}')
+mysql -h "$UPSTREAM_IP" -P 4000 -u root -e "
+  CREATE DATABASE IF NOT EXISTS cdc_test;
+  DROP TABLE IF EXISTS cdc_test.lag_tracker;
+  CREATE TABLE cdc_test.lag_tracker (
+      seq       INT NOT NULL PRIMARY KEY,
+      src_write_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+  );
+"
+"""
+        ssh_run(self.host, script, self.key_path, strict=False)
 
+    def _write_row(self) -> Optional[int]:
+        self._seq += 1
+        seq = self._seq
+        script = f"""
+UPSTREAM_IP=$(kubectl get svc {self.upstream_svc} -n {self.upstream_ns} \
+  -o jsonpath='{{.spec.clusterIP}}')
 mysql -h "$UPSTREAM_IP" -P 4000 -u root -N -e \
-  "UPDATE cdc_test.heartbeat SET src_ts=NOW(6) WHERE id=1; SELECT src_ts FROM cdc_test.heartbeat WHERE id=1;" 2>/dev/null | tail -1
-
-sleep 0.2
-
-mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
-  "SELECT src_ts FROM cdc_test.heartbeat WHERE id=1;" 2>/dev/null
+  "INSERT INTO cdc_test.lag_tracker (seq) VALUES ({seq});" 2>/dev/null \
+  && echo "OK"
 """
         result = ssh_capture(self.host, script, self.key_path)
-        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-        if len(lines) < 2:
-            return None
-        try:
-            from datetime import datetime as _dt
-            fmt = "%Y-%m-%d %H:%M:%S.%f"
-            up_ts = _dt.strptime(lines[0], fmt)
-            down_ts = _dt.strptime(lines[1], fmt)
-            return (up_ts - down_ts).total_seconds()
-        except (ValueError, IndexError):
-            return None
+        if "OK" in result.stdout:
+            return seq
+        return None
 
-    def _warmup(self):
-        """Prime the heartbeat so downstream has a recent value before we collect samples."""
-        log("  Warming up CDC lag tracker (priming heartbeat)...")
-        self._measure()
-        max_wait = 15
-        start = time.time()
-        while time.time() - start < max_wait:
-            time.sleep(2)
-            lag = self._measure()
-            if lag is not None and 0 <= lag < self.MAX_LAG_THRESHOLD:
-                log(f"  CDC lag tracker warmed up (initial lag: {lag:.1f}s)")
-                return
-        log("  CDC lag tracker warmup timed out; collecting samples anyway")
+    def _read_new_rows(self) -> list[int]:
+        script = f"""
+DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} \
+  -o jsonpath='{{.spec.clusterIP}}')
+mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
+  "SELECT seq FROM cdc_test.lag_tracker WHERE seq > {self._last_read_seq} ORDER BY seq;" 2>/dev/null
+"""
+        result = ssh_capture(self.host, script, self.key_path)
+        seqs: list[int] = []
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if line.isdigit():
+                seqs.append(int(line))
+        return seqs
 
-    def _run(self):
+    def _writer_loop(self):
         while not self._stop.is_set():
             try:
-                lag = self._measure()
-                if lag is not None and 0 <= lag < self.MAX_LAG_THRESHOLD:
-                    self._samples.append(lag)
+                t_before = time.monotonic()
+                seq = self._write_row()
+                if seq is not None:
+                    with self._pending_lock:
+                        self._pending[seq] = t_before
             except Exception:
                 pass
-            self._stop.wait(self.interval)
+            self._stop.wait(self.write_interval)
+
+    def _reader_loop(self):
+        while not self._stop.is_set():
+            try:
+                t_read = time.monotonic()
+                new_seqs = self._read_new_rows()
+                if new_seqs:
+                    with self._pending_lock:
+                        for seq in new_seqs:
+                            if seq in self._pending:
+                                lag = t_read - self._pending.pop(seq)
+                                if 0 <= lag < self.MAX_LAG_THRESHOLD:
+                                    self._samples.append(lag)
+                    self._last_read_seq = max(new_seqs)
+            except Exception:
+                pass
+            self._stop.wait(self.read_interval)
+
+    def _warmup(self):
+        log("  Warming up CDC lag tracker (waiting for first row to replicate)...")
+        self._init_table()
+        time.sleep(2)
+
+        seq = self._write_row()
+        if seq is None:
+            log("  CDC lag tracker warmup: failed to write seed row")
+            return
+
+        write_time = time.monotonic()
+        max_wait = 30
+        start = time.time()
+        while time.time() - start < max_wait:
+            time.sleep(1)
+            arrived = self._read_new_rows()
+            if seq in arrived:
+                lag = time.monotonic() - write_time
+                self._last_read_seq = seq
+                log(f"  CDC lag tracker warmed up (seed row lag: {lag:.1f}s)")
+                return
+        log("  CDC lag tracker warmup timed out; collecting samples anyway")
+        self._last_read_seq = seq
 
     def start(self):
         log("Starting TiCDC lag tracker...")
         self._warmup()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True)
+        self._writer_thread.start()
+        self._reader_thread.start()
 
     def stop(self):
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
+        if self._writer_thread:
+            self._writer_thread.join(timeout=5)
+        if self._reader_thread:
+            self._reader_thread.join(timeout=5)
         log(f"TiCDC lag tracker stopped ({len(self._samples)} samples)")
 
     def summary(self) -> dict:

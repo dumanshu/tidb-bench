@@ -1491,35 +1491,6 @@ echo "Downstream TiDB NodePort set to {DOWNSTREAM_NODEPORT}"
 """, ctx, strict=False)
 
 
-def create_cdc_heartbeat_table(host: InstanceInfo, ctx: BootstrapContext):
-    log("Creating CDC heartbeat table on upstream cluster")
-    ssh_run(host, """
-TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
-if [ -z "$TIDB_HOST" ]; then
-    TIDB_HOST="127.0.0.1"
-fi
-
-for i in $(seq 1 30); do
-    if mysql -h "$TIDB_HOST" -P 4000 -u root -e "SELECT 1" 2>/dev/null; then
-        break
-    fi
-    echo "Waiting for upstream TiDB... (attempt $i/30)"
-    sleep 5
-done
-
-mysql -h "$TIDB_HOST" -P 4000 -u root -e "
-CREATE DATABASE IF NOT EXISTS cdc_test;
-CREATE TABLE IF NOT EXISTS cdc_test.heartbeat (
-    id INT NOT NULL PRIMARY KEY,
-    src_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
-);
-INSERT INTO cdc_test.heartbeat (id, src_ts) VALUES (1, NOW(6))
-    ON DUPLICATE KEY UPDATE src_ts = NOW(6);
-"
-echo "Heartbeat table created on upstream"
-""", ctx, strict=False)
-
-
 def create_ticdc_changefeed(host: InstanceInfo, ctx: BootstrapContext):
     log("Creating TiCDC changefeed to downstream cluster")
     downstream_svc = f"{DOWNSTREAM_CLUSTER_NAME}-tidb.{DOWNSTREAM_NAMESPACE}.svc"
@@ -2023,9 +1994,6 @@ def main():
         log("=== Deploying Downstream TiDB Cluster ===")
         deploy_downstream_cluster(client, ctx)
         wait_for_downstream_ready(client, ctx)
-
-        log("=== Creating CDC Heartbeat Table ===")
-        create_cdc_heartbeat_table(client, ctx)
 
         log("=== Creating TiCDC Changefeed ===")
         create_ticdc_changefeed(client, ctx)

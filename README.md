@@ -6,7 +6,7 @@ Utilities for provisioning, validating, and benchmarking TiDB clusters on bare E
 
 - `tidb_setup.py` -- provisions VPC + EC2 resources across multiple AZs, installs k3s, deploys TiDB Operator and cluster(s), applies client-side tuning.
 - `tidb_validate.py` -- inspects the deployed cluster, runs health checks, prints SSH shortcuts and manual test commands.
-- `tidb_benchmark.py` -- runs sysbench benchmarks from the client host with resource monitoring, availability tracking, cost estimates, and optional TiCDC replication lag measurement.
+- `tidb_benchmark.py` -- runs sysbench benchmarks from the client host with resource monitoring, availability tracking, and optional TiCDC replication lag measurement.
 
 ## Prerequisites
 
@@ -85,7 +85,7 @@ VPC 10.43.0.0/16
 |
 +-- Client EC2
     +-- sysbench --> upstream (NodePort 30400)
-    +-- lag tracker --> reads heartbeat from downstream
+    +-- lag tracker --> writes to upstream, reads from downstream
 ```
 
 TiCDC is configured with:
@@ -159,7 +159,7 @@ The validator prints:
 - TiCDC status and changefeed health (when deployed)
 - Downstream cluster readiness (when deployed)
 - Manual benchmarking + connection commands
-- Resource usage and cost estimates
+- Resource usage
 
 ## Running Benchmarks
 
@@ -193,11 +193,11 @@ python3 tidb_benchmark.py --aws-profile sandbox --skip-prepare
 
 ### TiCDC Replication Benchmark
 
-When `--ticdc` is passed, the benchmark additionally:
-1. Inserts heartbeat rows into the upstream cluster
-2. Polls the downstream cluster for those heartbeats
-3. Computes and records replication lag at 1-second intervals throughout the run
-4. Reports lag statistics (min, avg, p50, p99, max) alongside benchmark results
+When `--ticdc` is passed, the benchmark measures end-to-end replication lag using injected timestamps:
+1. A writer thread INSERTs sequenced rows into `cdc_test.lag_tracker` on the upstream cluster, recording the local write time
+2. A reader thread polls the downstream cluster for newly replicated rows
+3. Lag per row = time the row appeared on downstream minus the time it was written to upstream (both measured on the client, avoiding clock skew)
+4. Reports lag statistics (min, avg, p50, p95, p99, max) alongside benchmark results
 
 ```bash
 # Benchmark with TiCDC lag measurement (port defaults to 30400)
@@ -220,13 +220,13 @@ The TiCDC benchmark output includes a replication lag section:
 ======================================================================
 TICDC REPLICATION LAG
 ======================================================================
-  Samples:      300
-  Min Lag:      45.2 ms
-  Avg Lag:      127.8 ms
-  P50 Lag:      112.3 ms
-  P99 Lag:      289.1 ms
-  Max Lag:      412.5 ms
-  Lag Stddev:   67.4 ms
+Samples: 287
+  Min:  1.823s
+  Avg:  2.641s
+  P50:  2.589s
+  P95:  3.412s
+  P99:  4.107s
+  Max:  5.231s
 ======================================================================
 ```
 
@@ -266,11 +266,9 @@ TICDC REPLICATION LAG
 The benchmark provides comprehensive output including:
 
 - **Workload Summary**: Description of operations, dataset size, concurrency
-- **Per-Minute Resource Snapshots**: CPU/memory usage with cost accrual
+- **Per-Minute Resource Snapshots**: CPU/memory usage
 - **Availability Tracking**: Success rate accounting for ignored transient errors
 - **P99 Latency**: 99th percentile latency metrics
-- **Cost Analysis**: Client vs server breakdown, price-performance metrics ($/QPS, $/TPS)
-- **Monthly Projections**: Compute, storage, network cost estimates
 - **TiCDC Replication Lag** (when `--ticdc`): Min/avg/p50/p99/max lag with standard deviation
 
 Sample output:
@@ -293,12 +291,6 @@ BENCHMARK RESULTS: oltp_read_write
     Min: 58.38 | Avg: 179.11 | P99: 292.6 | Max: 430.43
   Availability:
     Success Rate: 100.000%
-
-======================================================================
-COST SUMMARY
-======================================================================
-Monthly $/QPS: $0.0700
-TOTAL: $499.89/month
 ======================================================================
 ```
 
