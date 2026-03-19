@@ -1569,7 +1569,7 @@ if sudo dnf -y install sysbench 2>/dev/null; then
 fi
 
 # Build from source - need to handle Amazon Linux 2023 which uses MariaDB
-sudo dnf -y install mariadb-connector-c-devel libaio-devel automake libtool make gcc gcc-c++ || true
+sudo dnf -y install git mariadb-connector-c-devel libaio-devel automake libtool make gcc gcc-c++ || true
 
 # Create symlinks for MySQL compatibility (AL2023 uses mariadb paths)
 if [ -d /usr/include/mariadb ] && [ ! -f /usr/include/mysql.h ]; then
