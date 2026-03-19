@@ -200,22 +200,18 @@ When `--ticdc` is passed, the benchmark additionally:
 4. Reports lag statistics (min, avg, p50, p99, max) alongside benchmark results
 
 ```bash
-# Benchmark with TiCDC lag measurement
+# Benchmark with TiCDC lag measurement (port defaults to 30400)
 python3 tidb_benchmark.py \
   --aws-profile sandbox \
   --profile standard \
-  --ticdc \
-  --downstream-host <DOWNSTREAM_PUBLIC_IP> \
-  --downstream-port 30401
+  --ticdc
 
-# With custom upstream connection
+# With explicit host overrides
 python3 tidb_benchmark.py \
   --aws-profile sandbox \
   --ticdc \
   --upstream-host <UPSTREAM_PUBLIC_IP> \
-  --upstream-port 30400 \
-  --downstream-host <DOWNSTREAM_PUBLIC_IP> \
-  --downstream-port 30401
+  --downstream-host <DOWNSTREAM_PUBLIC_IP>
 ```
 
 The TiCDC benchmark output includes a replication lag section:

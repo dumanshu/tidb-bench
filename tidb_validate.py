@@ -18,7 +18,7 @@ from botocore.config import Config
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
-DEFAULT_PORT = 4000
+DEFAULT_PORT = 30400
 
 BOTO_CONFIG = Config(
     retries={"max_attempts": 10, "mode": "adaptive"},

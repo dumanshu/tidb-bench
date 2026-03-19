@@ -28,7 +28,8 @@ from botocore.config import Config
 DEFAULT_REGION = "us-east-1"
 DEFAULT_SEED = "tidblt-001"
 DEFAULT_PROFILE = os.environ.get("AWS_PROFILE", "sandbox")
-DEFAULT_PORT = 4000
+DEFAULT_PORT = 30400
+INTERNAL_SERVICE_PORT = 4000
 DEFAULT_DATABASE = "sbtest"
 
 
@@ -266,13 +267,17 @@ class CostTracker:
         log("=" * 70)
 
 class CdcLagTracker:
+    # Discard any lag sample exceeding this threshold (seconds).  Stale
+    # downstream heartbeat rows from prior sessions can produce spurious
+    # values in the tens-of-thousands of seconds.
+    MAX_LAG_THRESHOLD = 120.0
 
     def __init__(self, host: str, key_path: Path,
                  upstream_svc: str = "basic-tidb",
                  upstream_ns: str = "tidb-cluster",
                  downstream_svc: str = "downstream-tidb",
                  downstream_ns: str = "tidb-downstream",
-                 downstream_port: int = DEFAULT_PORT,
+                 downstream_port: int = INTERNAL_SERVICE_PORT,
                  interval: float = 1.0):
         self.host = host
         self.key_path = key_path
@@ -312,11 +317,25 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
         except (ValueError, IndexError):
             return None
 
+    def _warmup(self):
+        """Prime the heartbeat so downstream has a recent value before we collect samples."""
+        log("  Warming up CDC lag tracker (priming heartbeat)...")
+        self._measure()
+        max_wait = 15
+        start = time.time()
+        while time.time() - start < max_wait:
+            time.sleep(2)
+            lag = self._measure()
+            if lag is not None and 0 <= lag < self.MAX_LAG_THRESHOLD:
+                log(f"  CDC lag tracker warmed up (initial lag: {lag:.1f}s)")
+                return
+        log("  CDC lag tracker warmup timed out; collecting samples anyway")
+
     def _run(self):
         while not self._stop.is_set():
             try:
                 lag = self._measure()
-                if lag is not None and lag >= 0:
+                if lag is not None and 0 <= lag < self.MAX_LAG_THRESHOLD:
                     self._samples.append(lag)
             except Exception:
                 pass
@@ -324,6 +343,7 @@ mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
 
     def start(self):
         log("Starting TiCDC lag tracker...")
+        self._warmup()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -659,9 +679,10 @@ def print_cluster_summary(host: str, key_path: Path, region: str, profile: str, 
     log(f"EC2 Compute: ${hourly_compute:.3f}/hr | EBS Storage: ${hourly_storage:.4f}/hr | Total: ${total_hourly:.3f}/hr")
     log("=" * 80)
 
-def start_resource_monitor(host: str, key_path: Path, interval: int = 60, 
+def start_resource_monitor(host: str, key_path: Path, interval: int = 60,
                           cost_tracker: Optional['CostTracker'] = None,
-                          start_time: Optional[float] = None) -> threading.Thread:
+                          start_time: Optional[float] = None,
+                          port: int = DEFAULT_PORT) -> threading.Thread:
     """Start background thread that logs resource utilization every interval."""
     stop_event = threading.Event()
     _start_time = start_time or time.time()
@@ -673,14 +694,12 @@ def start_resource_monitor(host: str, key_path: Path, interval: int = 60,
             elapsed = time.time() - _start_time
             elapsed_min = elapsed / 60
             
-            script = """
-# Compact resource summary
+            script = f"TIDB_PORT={port}\n" + """
 echo "--- $(date +%H:%M:%S) Resource Snapshot ---"
 
-# Client VM stats
 CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
 MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
-CONN=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';" 2>/dev/null || echo "N/A")
+CONN=$(mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_connected';" 2>/dev/null || echo "N/A")
 echo "Client: CPU=${CPU}% Mem=${MEM} Conn=${CONN}"
 
 # Pod utilization (compact)
@@ -767,16 +786,14 @@ def parse_interval_line(line: str) -> dict:
     }
 
 
-def fetch_resource_snapshot_compact(host: str, key_path: Path) -> str:
+def fetch_resource_snapshot_compact(host: str, key_path: Path, port: int = DEFAULT_PORT) -> str:
     """Fetch a compact resource snapshot from the remote host. Returns formatted string."""
-    script = '''
-# Client CPU
+    script = f"TIDB_PORT={port}\n" + '''
 CPU=$(top -bn1 | grep "Cpu(s)" | awk '{printf "%.0f%%", $2+$4}' 2>/dev/null || echo "N/A")
 MEM=$(free -m | awk 'NR==2{printf "%.0f%%", $3*100/$2}' 2>/dev/null || echo "N/A")
 echo "CLIENT cpu=$CPU mem=$MEM"
 
-# Per-node resource from TiDB CLUSTER_LOAD
-mysql -h 127.0.0.1 -P 4000 -u root -N -e "
+mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "
 SELECT
     CONCAT('NODE ', TYPE, '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
            ' cpu=', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
@@ -1114,7 +1131,7 @@ def run_sysbench_streaming(
             if minute_of > current_minute:
                 # Print report for the completed minute
                 if current_minute > 0 and minute_intervals:
-                    resource_text = fetch_resource_snapshot_compact(host, key_path)
+                    resource_text = fetch_resource_snapshot_compact(host, key_path, port)
                     report = format_minute_report(
                         current_minute, minute_intervals, resource_text
                     )
@@ -1133,7 +1150,7 @@ def run_sysbench_streaming(
 
     # Print final minute report if there are remaining intervals
     if minute_intervals:
-        resource_text = fetch_resource_snapshot_compact(host, key_path)
+        resource_text = fetch_resource_snapshot_compact(host, key_path, port)
         report = format_minute_report(
             current_minute, minute_intervals, resource_text
         )
@@ -1731,21 +1748,21 @@ sysbench oltp_read_write \\
 """, key_path, strict=False)
 
 
-def fetch_final_resource_snapshot(host: str, key_path: Path):
+def fetch_final_resource_snapshot(host: str, key_path: Path, port: int = DEFAULT_PORT):
     """Fetch final resource utilization snapshot."""
     log("")
     log("=" * 70)
     log("FINAL RESOURCE UTILIZATION")
     log("=" * 70)
     
-    script = '''
+    script = f"TIDB_PORT={port}\n" + '''
 echo "--- Client VM ---"
 echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{printf "%.1f%% user, %.1f%% sys, %.1f%% idle", $2, $4, $8}')"
 echo "Memory: $(free -h | awk 'NR==2{printf "%s used / %s total (%.1f%%)", $3, $2, $3*100/$2}')"
 echo "Load: $(cat /proc/loadavg | awk '{print $1, $2, $3}')"
 echo ""
 echo "--- TiDB Cluster Nodes ---"
-mysql -h 127.0.0.1 -P 4000 -u root -N -e "
+mysql -h 127.0.0.1 -P $TIDB_PORT -u root -N -e "
 SELECT
     CONCAT(UPPER(TYPE), '-', SUBSTRING_INDEX(SUBSTRING_INDEX(INSTANCE, '.', 1), '-', -1),
            '  CPU: ', ROUND((1 - MAX(CASE WHEN NAME='idle' AND DEVICE_NAME='usage' THEN VALUE ELSE NULL END)) * 100), '%',
@@ -1904,8 +1921,8 @@ def parse_args():
     parser.add_argument(
         "--downstream-port",
         type=int,
-        default=DEFAULT_PORT,
-        help=f"Downstream TiDB port (default: {DEFAULT_PORT})",
+        default=INTERNAL_SERVICE_PORT,
+        help=f"Downstream TiDB internal service port (default: {INTERNAL_SERVICE_PORT})",
     )
 
     return parser.parse_args()
@@ -2176,7 +2193,7 @@ mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_co
     )
 
     # Final resource snapshot + disk utilization
-    fetch_final_resource_snapshot(host, key_path)
+    fetch_final_resource_snapshot(host, key_path, args.port)
     if load_stats:
         disk_final = get_disk_utilization(host, key_path, args.port, detected_ebs_gb, database)
         log("")
