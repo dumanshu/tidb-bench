@@ -54,7 +54,11 @@ PRODUCTION_INSTANCE_TYPES = {
     "pd": "c7g.xlarge",      # 4 vCPU, 8GB - metadata/scheduling
     "tidb": "c7g.4xlarge",   # 16 vCPU, 32GB - compute optimized for SQL
     "tikv": "m7g.4xlarge",   # 16 vCPU, 64GB - memory optimized for storage
+    "ticdc": "c7g.4xlarge",  # 16 vCPU, 32GB - CDC replication (CPU + disk IO bound)
     "client": "c7g.4xlarge", # 16 vCPU, 32GB - benchmark client
+    "downstream-pd": "c7g.xlarge",
+    "downstream-tidb": "c7g.4xlarge",
+    "downstream-tikv": "m7g.4xlarge",
 }
 
 # Cost-optimized instance types for testing/benchmarking
@@ -62,7 +66,11 @@ BENCHMARK_INSTANCE_TYPES = {
     "pd": "c7g.large",       # 2 vCPU, 4GB
     "tidb": "c7g.2xlarge",   # 8 vCPU, 16GB
     "tikv": "m7g.2xlarge",   # 8 vCPU, 32GB
+    "ticdc": "c7g.2xlarge",  # 8 vCPU, 16GB
     "client": "c7g.2xlarge", # 8 vCPU, 16GB
+    "downstream-pd": "c7g.large",
+    "downstream-tidb": "c7g.2xlarge",
+    "downstream-tikv": "m7g.2xlarge",
 }
 
 # EBS gp3 storage recommendations from PingCAP
@@ -80,6 +88,12 @@ EBS_CONFIG = {
         "throughput": 125,  # MiB/s
         "size_gb": 50,
     },
+    "ticdc": {
+        "type": "gp3",
+        "iops": 3000,
+        "throughput": 250,  # MiB/s - TiCDC sort-dir I/O
+        "size_gb": 500,
+    },
 }
 
 # Root volume sizes per role (GB)
@@ -88,10 +102,21 @@ ROOT_VOLUME_SIZES = {
     "pd": 50,
     "tikv": 500,
     "tidb": 50,
+    "ticdc": 500,
+    "downstream-pd": 50,
+    "downstream-tikv": 500,
+    "downstream-tidb": 50,
 }
 
 # Multi-AZ configuration
 AVAILABILITY_ZONES = ["us-east-1a", "us-east-1b", "us-east-1c"]
+
+# Per-AZ subnet CIDRs (one public subnet per AZ for true multi-AZ)
+SUBNET_CIDRS = {
+    "us-east-1a": "10.43.1.0/24",
+    "us-east-1b": "10.43.2.0/24",
+    "us-east-1c": "10.43.3.0/24",
+}
 
 AMI_OVERRIDE = os.environ.get("TIDB_AMI_ID")
 AMI_SSM_PARAM = os.environ.get(
@@ -189,6 +214,35 @@ def parse_args():
         "--client-zone",
         default="us-east-1a",
         help="AZ for client VM; leaders prefer this zone (default: us-east-1a).",
+    )
+    parser.add_argument(
+        "--ticdc",
+        action="store_true",
+        help="Enable TiCDC replication mode: deploy downstream cluster + changefeed.",
+    )
+    parser.add_argument(
+        "--ticdc-replicas",
+        type=int,
+        default=1,
+        help="Number of TiCDC replicas (default: 1).",
+    )
+    parser.add_argument(
+        "--downstream-pd-replicas",
+        type=int,
+        default=3,
+        help="PD replicas for downstream cluster (default: 3).",
+    )
+    parser.add_argument(
+        "--downstream-tikv-replicas",
+        type=int,
+        default=3,
+        help="TiKV replicas for downstream cluster (default: 3).",
+    )
+    parser.add_argument(
+        "--downstream-tidb-replicas",
+        type=int,
+        default=1,
+        help="TiDB replicas for downstream cluster (default: 1).",
     )
     return parser
 
@@ -312,27 +366,35 @@ class BootstrapContext:
     pd_nodes: List[InstanceInfo] = field(default_factory=list)
     tikv_nodes: List[InstanceInfo] = field(default_factory=list)
     tidb_nodes: List[InstanceInfo] = field(default_factory=list)
+    ticdc_nodes: List[InstanceInfo] = field(default_factory=list)
+    downstream_pd_nodes: List[InstanceInfo] = field(default_factory=list)
+    downstream_tikv_nodes: List[InstanceInfo] = field(default_factory=list)
+    downstream_tidb_nodes: List[InstanceInfo] = field(default_factory=list)
     tidb_version: str = TIDB_VERSION
     pd_replicas: int = 3
     tikv_replicas: int = 3
     tidb_replicas: int = 2
+    ticdc_replicas: int = 0
+    enable_ticdc: bool = False
+    downstream_pd_replicas: int = 3
+    downstream_tikv_replicas: int = 3
+    downstream_tidb_replicas: int = 1
     multi_az: bool = False
     production: bool = False
     client_zone: str = "us-east-1a"
 
     @property
     def host(self) -> InstanceInfo:
-        """Backward compatibility: client is the main host for SSH operations."""
         return self.client
 
     @property
     def all_agent_nodes(self) -> List[InstanceInfo]:
-        """All k3s agent nodes (everything except client/server)."""
-        return self.pd_nodes + self.tikv_nodes + self.tidb_nodes
+        nodes = self.pd_nodes + self.tikv_nodes + self.tidb_nodes + self.ticdc_nodes
+        nodes += self.downstream_pd_nodes + self.downstream_tikv_nodes + self.downstream_tidb_nodes
+        return nodes
 
     @property
     def all_nodes(self) -> List[InstanceInfo]:
-        """All nodes including client."""
         return [self.client] + self.all_agent_nodes
 
 
@@ -349,16 +411,39 @@ def describe_instance(iid):
 
 
 def ssh_base_cmd(host: InstanceInfo, ctx: BootstrapContext):
-    cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "ConnectTimeout=30",
-        "-i", str(ctx.ssh_key_path),
-        f"ec2-user@{host.public_ip}",
-        "bash", "-s"
-    ]
+    """Build SSH command for a node.
+    
+    For the client node: direct SSH via public IP.
+    For agent nodes: SSH via ProxyJump through client (private IP), since
+    some AWS public IPs may not be routable from corporate VPNs.
+    """
+    is_agent = host.role != "client"
+    if is_agent and ctx.client and ctx.client.public_ip:
+        # Use ProxyJump through client to reach agent via private IP
+        proxy = f"ec2-user@{ctx.client.public_ip}"
+        target_ip = host.private_ip
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=30",
+            "-i", str(ctx.ssh_key_path),
+            "-o", f"ProxyCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -i {ctx.ssh_key_path} -W %h:%p {proxy}",
+            f"ec2-user@{target_ip}",
+            "bash", "-s"
+        ]
+    else:
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "ConnectTimeout=30",
+            "-i", str(ctx.ssh_key_path),
+            f"ec2-user@{host.public_ip}",
+            "bash", "-s"
+        ]
     return cmd
 
 
@@ -705,15 +790,18 @@ def instance_info_from_id(iid, role) -> InstanceInfo:
     )
 
 
-def provision_role_instances(role, count, instance_types, subnet_id, sg_id, production):
-    """Provision `count` EC2 instances for a given role. Returns list of instance IDs."""
+def provision_role_instances(role, count, instance_types, subnet_ids, sg_id, production):
+    """Provision `count` EC2 instances for a given role, round-robin across subnet_ids."""
+    if isinstance(subnet_ids, str):
+        subnet_ids = [subnet_ids]
     types = PRODUCTION_INSTANCE_TYPES if production else BENCHMARK_INSTANCE_TYPES
     itype = types.get(role, instance_types.get(role, CLIENT_INSTANCE_TYPE))
     vol_size = ROOT_VOLUME_SIZES.get(role, 100)
     ids = []
     for i in range(1, count + 1):
+        subnet = subnet_ids[(i - 1) % len(subnet_ids)]
         name = f"{STACK}-{role}-{i}"
-        iid = ensure_instance(name, role, itype, subnet_id, sg_id, vol_size)
+        iid = ensure_instance(name, role, itype, subnet, sg_id, vol_size)
         ids.append(iid)
     return ids
 
@@ -738,9 +826,9 @@ fs.inotify.max_user_instances = 512
 EOF
 
 sudo tee /etc/sysctl.d/99-tidb-bench.conf >/dev/null <<'EOF'
-# File descriptor limits
-fs.file-max = 1000000
-fs.nr_open = 1000000
+# File descriptor limits (nr_open must be >= k3s LimitNOFILE=1048576)
+fs.file-max = 1048576
+fs.nr_open = 1048576
 
 # Network tuning for high-throughput benchmarks
 net.core.somaxconn = 65535
@@ -884,6 +972,14 @@ kubectl get nodes -o wide
         _label_taint_node(ctx, node.private_ip, "tikv")
     for node in ctx.tidb_nodes:
         _label_taint_node(ctx, node.private_ip, "tidb")
+    for node in ctx.ticdc_nodes:
+        _label_taint_node(ctx, node.private_ip, "ticdc")
+    for node in ctx.downstream_pd_nodes:
+        _label_taint_node(ctx, node.private_ip, "downstream-pd")
+    for node in ctx.downstream_tikv_nodes:
+        _label_taint_node(ctx, node.private_ip, "downstream-tikv")
+    for node in ctx.downstream_tidb_nodes:
+        _label_taint_node(ctx, node.private_ip, "downstream-tidb")
 
 
 def _label_taint_node(ctx: BootstrapContext, node_ip: str, component: str):
@@ -907,6 +1003,62 @@ kubectl taint node "$NODE_NAME" tidb.pingcap.com/{component}:NoSchedule --overwr
 
 # Also add a zone label based on the node's AZ for topology-aware scheduling
 kubectl label node "$NODE_NAME" topology.kubernetes.io/zone=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null || echo "unknown") --overwrite 2>/dev/null || true
+""", ctx, strict=False)
+
+
+# ---------------------------------------------------------------------------
+# Local-path storage provisioner (k3s local-storage is disabled)
+# ---------------------------------------------------------------------------
+
+LOCAL_PATH_PROVISIONER_URL = (
+    "https://raw.githubusercontent.com/rancher/local-path-provisioner"
+    "/v0.0.30/deploy/local-path-storage.yaml"
+)
+
+
+def install_local_path_provisioner(host: InstanceInfo, ctx: BootstrapContext):
+    log("Installing local-path-provisioner for PV storage")
+    ssh_run(host, f"""
+if kubectl get sc local-path >/dev/null 2>&1; then
+    echo "local-path StorageClass already exists"
+    exit 0
+fi
+
+kubectl apply -f {LOCAL_PATH_PROVISIONER_URL}
+
+kubectl patch storageclass local-path -p \
+    '{{"metadata":{{"annotations":{{"storageclass.kubernetes.io/is-default-class":"true"}}}}}}'
+
+kubectl patch deployment local-path-provisioner -n local-path-storage --type='json' \
+    -p='[{{"op":"add","path":"/spec/template/spec/tolerations","value":[{{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}}]}}]'
+
+for i in $(seq 1 30); do
+    READY=$(kubectl get pods -n local-path-storage \
+        -l app.kubernetes.io/name=local-path-provisioner \
+        -o jsonpath='{{.items[0].status.containerStatuses[0].ready}}' 2>/dev/null || echo "false")
+    if [ "$READY" = "true" ]; then
+        echo "local-path-provisioner is ready"
+        break
+    fi
+    echo "Waiting for local-path-provisioner... (attempt $i/30)"
+    sleep 5
+done
+
+kubectl get sc
+""", ctx)
+
+
+def label_control_plane_zone(host: InstanceInfo, ctx: BootstrapContext):
+    log("Labeling control-plane node with availability zone")
+    ssh_run(host, f"""
+CP_NODE=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{{.items[0].metadata.name}}')
+ZONE=$(kubectl get node $CP_NODE -o jsonpath='{{.metadata.labels.topology\\.kubernetes\\.io/zone}}' 2>/dev/null || echo "")
+if [ -n "$ZONE" ]; then
+    echo "Control-plane node already has zone label: $ZONE"
+    exit 0
+fi
+kubectl label node $CP_NODE topology.kubernetes.io/zone={AVAILABILITY_ZONES[0]}
+echo "Labeled $CP_NODE with zone {AVAILABILITY_ZONES[0]}"
 """, ctx, strict=False)
 
 
@@ -949,7 +1101,14 @@ kubectl create namespace tidb-admin || true
 if helm status tidb-operator -n tidb-admin >/dev/null 2>&1; then
     echo "TiDB Operator already installed"
 else
-    helm install --namespace tidb-admin tidb-operator pingcap/tidb-operator --version {TIDB_OPERATOR_VERSION} --wait
+    helm install --namespace tidb-admin tidb-operator pingcap/tidb-operator --version {TIDB_OPERATOR_VERSION} \
+        --set controllerManager.tolerations[0].key=node-role.kubernetes.io/control-plane \
+        --set controllerManager.tolerations[0].effect=NoSchedule \
+        --set controllerManager.tolerations[0].operator=Exists \
+        --set scheduler.tolerations[0].key=node-role.kubernetes.io/control-plane \
+        --set scheduler.tolerations[0].effect=NoSchedule \
+        --set scheduler.tolerations[0].operator=Exists \
+        --timeout 10m --wait
 fi
 
 kubectl get pods --namespace tidb-admin -l app.kubernetes.io/instance=tidb-operator
@@ -968,19 +1127,12 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     tikv_extra_config = ""
 
     if ctx.multi_az:
+        # PD config is TOML format -- use proper TOML syntax with quoted strings
         pd_config_block = (
-            "      replication:\n"
-            "        location-labels:\n"
-            "          - zone\n"
-            "          - host\n"
-            "        max-replicas: 3\n"
-            "      enable-placement-rules: true"
-        )
-        tikv_extra_config = (
-            "      server:\n"
-            "        labels:\n"
-            "          zone: \"auto\"\n"
-            "          host: \"auto\""
+            '      [replication]\n'
+            '      location-labels = ["topology.kubernetes.io/zone", "kubernetes.io/hostname"]\n'
+            '      max-replicas = 3\n'
+            '      enable-placement-rules = true'
         )
 
     # Build the YAML as a plain Python string (no f-string for the YAML body)
@@ -997,10 +1149,17 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     yaml_lines.append('  pvReclaimPolicy: Retain')
     yaml_lines.append('  enableDynamicConfiguration: true')
     yaml_lines.append('  configUpdateStrategy: RollingUpdate')
-    yaml_lines.append('  discovery: {}')
+    yaml_lines.append('  discovery:')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: node-role.kubernetes.io/control-plane')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
     yaml_lines.append('  helper:')
     yaml_lines.append('    image: alpine:3.16.0')
-    # PD
+    if ctx.multi_az:
+        yaml_lines.append('  topologySpreadConstraints:')
+        yaml_lines.append('    - topologyKey: topology.kubernetes.io/zone')
+        yaml_lines.append('      maxSkew: 1')
     yaml_lines.append('  pd:')
     yaml_lines.append('    baseImage: pingcap/pd')
     yaml_lines.append('    maxFailoverCount: 0')
@@ -1037,14 +1196,12 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     yaml_lines.append('    requests:')
     yaml_lines.append('      storage: "50Gi"')
     yaml_lines.append('    config: |')
-    yaml_lines.append('      storage:')
-    yaml_lines.append('        reserve-space: "0MB"')
-    yaml_lines.append('      rocksdb:')
-    yaml_lines.append('        max-open-files: 256')
-    yaml_lines.append('      raftdb:')
-    yaml_lines.append('        max-open-files: 256')
-    if tikv_extra_config:
-        yaml_lines.append(tikv_extra_config)
+    yaml_lines.append('      [storage]')
+    yaml_lines.append('      reserve-space = "0MB"')
+    yaml_lines.append('      [rocksdb]')
+    yaml_lines.append('      max-open-files = 256')
+    yaml_lines.append('      [raftdb]')
+    yaml_lines.append('      max-open-files = 256')
     yaml_lines.append('    nodeSelector:')
     yaml_lines.append('      tidb.pingcap.com/tikv: ""')
     yaml_lines.append('    tolerations:')
@@ -1087,6 +1244,33 @@ def deploy_tidb_cluster(host: InstanceInfo, ctx: BootstrapContext):
     yaml_lines.append('                    values:')
     yaml_lines.append('                      - tidb')
     yaml_lines.append('              topologyKey: kubernetes.io/hostname')
+    if ctx.enable_ticdc:
+        yaml_lines.append('  ticdc:')
+        yaml_lines.append('    baseImage: pingcap/ticdc')
+        yaml_lines.append(f'    replicas: {ctx.ticdc_replicas}')
+        yaml_lines.append('    config: |')
+        yaml_lines.append('      newarch = true')
+        yaml_lines.append('      gc-ttl = 86400')
+        yaml_lines.append('    requests:')
+        yaml_lines.append('      storage: "500Gi"')
+        yaml_lines.append('    nodeSelector:')
+        yaml_lines.append('      tidb.pingcap.com/ticdc: ""')
+        yaml_lines.append('    tolerations:')
+        yaml_lines.append('      - key: tidb.pingcap.com/ticdc')
+        yaml_lines.append('        operator: Exists')
+        yaml_lines.append('        effect: NoSchedule')
+        yaml_lines.append('    affinity:')
+        yaml_lines.append('      podAntiAffinity:')
+        yaml_lines.append('        preferredDuringSchedulingIgnoredDuringExecution:')
+        yaml_lines.append('          - weight: 100')
+        yaml_lines.append('            podAffinityTerm:')
+        yaml_lines.append('              labelSelector:')
+        yaml_lines.append('                matchExpressions:')
+        yaml_lines.append('                  - key: app.kubernetes.io/component')
+        yaml_lines.append('                    operator: In')
+        yaml_lines.append('                    values:')
+        yaml_lines.append('                      - ticdc')
+        yaml_lines.append('              topologyKey: kubernetes.io/hostname')
 
     yaml_str = '\n'.join(yaml_lines)
 
@@ -1181,6 +1365,207 @@ CREATE PLACEMENT POLICY IF NOT EXISTS local_leader
 -- Show placement policies
 SHOW PLACEMENT;
 " 2>/dev/null || echo "Note: Placement rules require TiDB 5.2+ and enabled placement-rules"
+""", ctx, strict=False)
+
+
+# ---------------------------------------------------------------------------
+# TiCDC downstream cluster + changefeed
+# ---------------------------------------------------------------------------
+
+DOWNSTREAM_NAMESPACE = "tidb-downstream"
+DOWNSTREAM_CLUSTER_NAME = "downstream"
+DOWNSTREAM_NODEPORT = 30401
+
+
+def deploy_downstream_cluster(host: InstanceInfo, ctx: BootstrapContext):
+    log(f"Deploying downstream TiDB cluster in namespace {DOWNSTREAM_NAMESPACE}")
+
+    yaml_lines = []
+    yaml_lines.append('apiVersion: pingcap.com/v1alpha1')
+    yaml_lines.append('kind: TidbCluster')
+    yaml_lines.append('metadata:')
+    yaml_lines.append(f'  name: {DOWNSTREAM_CLUSTER_NAME}')
+    yaml_lines.append(f'  namespace: {DOWNSTREAM_NAMESPACE}')
+    yaml_lines.append('spec:')
+    yaml_lines.append(f'  version: {ctx.tidb_version}')
+    yaml_lines.append('  timezone: UTC')
+    yaml_lines.append('  pvReclaimPolicy: Retain')
+    yaml_lines.append('  enableDynamicConfiguration: true')
+    yaml_lines.append('  configUpdateStrategy: RollingUpdate')
+    yaml_lines.append('  discovery:')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: node-role.kubernetes.io/control-plane')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('  helper:')
+    yaml_lines.append('    image: alpine:3.16.0')
+    yaml_lines.append('  pd:')
+    yaml_lines.append('    baseImage: pingcap/pd')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append(f'    replicas: {ctx.downstream_pd_replicas}')
+    yaml_lines.append('    requests:')
+    yaml_lines.append('      storage: "10Gi"')
+    yaml_lines.append('    config: {}')
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/downstream-pd: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/downstream-pd')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('  tikv:')
+    yaml_lines.append('    baseImage: pingcap/tikv')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append('    evictLeaderTimeout: 1m')
+    yaml_lines.append(f'    replicas: {ctx.downstream_tikv_replicas}')
+    yaml_lines.append('    requests:')
+    yaml_lines.append('      storage: "50Gi"')
+    yaml_lines.append('    config: |')
+    yaml_lines.append('      [storage]')
+    yaml_lines.append('      reserve-space = "0MB"')
+    yaml_lines.append('      [rocksdb]')
+    yaml_lines.append('      max-open-files = 256')
+    yaml_lines.append('      [raftdb]')
+    yaml_lines.append('      max-open-files = 256')
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/downstream-tikv: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/downstream-tikv')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+    yaml_lines.append('  tidb:')
+    yaml_lines.append('    baseImage: pingcap/tidb')
+    yaml_lines.append('    maxFailoverCount: 0')
+    yaml_lines.append(f'    replicas: {ctx.downstream_tidb_replicas}')
+    yaml_lines.append('    service:')
+    yaml_lines.append('      type: NodePort')
+    yaml_lines.append('    config: {}')
+    yaml_lines.append('    nodeSelector:')
+    yaml_lines.append('      tidb.pingcap.com/downstream-tidb: ""')
+    yaml_lines.append('    tolerations:')
+    yaml_lines.append('      - key: tidb.pingcap.com/downstream-tidb')
+    yaml_lines.append('        operator: Exists')
+    yaml_lines.append('        effect: NoSchedule')
+
+    yaml_str = '\n'.join(yaml_lines)
+    yaml_b64 = base64.b64encode(yaml_str.encode()).decode()
+
+    ssh_run(host, f"""
+kubectl create namespace {DOWNSTREAM_NAMESPACE} || true
+
+echo '{yaml_b64}' | base64 -d > /tmp/tidb-downstream.yaml
+kubectl apply -f /tmp/tidb-downstream.yaml -n {DOWNSTREAM_NAMESPACE}
+
+echo "Waiting for downstream TiDB service..."
+for i in $(seq 1 30); do
+    if kubectl get svc {DOWNSTREAM_CLUSTER_NAME}-tidb -n {DOWNSTREAM_NAMESPACE} >/dev/null 2>&1; then
+        kubectl patch svc {DOWNSTREAM_CLUSTER_NAME}-tidb -n {DOWNSTREAM_NAMESPACE} --type='json' \
+            -p='[{{"op": "replace", "path": "/spec/ports/0/nodePort", "value": {DOWNSTREAM_NODEPORT}}}]' || true
+        break
+    fi
+    sleep 2
+done
+""", ctx)
+
+
+def wait_for_downstream_ready(host: InstanceInfo, ctx: BootstrapContext):
+    log("Waiting for downstream TiDB cluster to be ready...")
+    ssh_run(host, f"""
+for i in $(seq 1 60); do
+    READY=$(kubectl get pods -n {DOWNSTREAM_NAMESPACE} -l app.kubernetes.io/component=tidb \
+        -o jsonpath='{{.items[0].status.containerStatuses[0].ready}}' 2>/dev/null || echo "false")
+    if [ "$READY" = "true" ]; then
+        echo "Downstream TiDB is ready!"
+        break
+    fi
+    echo "Waiting for downstream TiDB... (attempt $i/60)"
+    kubectl get pods -n {DOWNSTREAM_NAMESPACE} 2>/dev/null || true
+    sleep 10
+done
+
+kubectl get pods -n {DOWNSTREAM_NAMESPACE}
+kubectl get svc -n {DOWNSTREAM_NAMESPACE}
+
+kubectl patch svc {DOWNSTREAM_CLUSTER_NAME}-tidb -n {DOWNSTREAM_NAMESPACE} --type='json' \
+    -p='[{{"op": "replace", "path": "/spec/ports/0/nodePort", "value": {DOWNSTREAM_NODEPORT}}}]' 2>/dev/null || true
+echo "Downstream TiDB NodePort set to {DOWNSTREAM_NODEPORT}"
+""", ctx, strict=False)
+
+
+def create_cdc_heartbeat_table(host: InstanceInfo, ctx: BootstrapContext):
+    log("Creating CDC heartbeat table on upstream cluster")
+    ssh_run(host, """
+TIDB_HOST=$(kubectl get svc basic-tidb -n tidb-cluster -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+if [ -z "$TIDB_HOST" ]; then
+    TIDB_HOST="127.0.0.1"
+fi
+
+for i in $(seq 1 30); do
+    if mysql -h "$TIDB_HOST" -P 4000 -u root -e "SELECT 1" 2>/dev/null; then
+        break
+    fi
+    echo "Waiting for upstream TiDB... (attempt $i/30)"
+    sleep 5
+done
+
+mysql -h "$TIDB_HOST" -P 4000 -u root -e "
+CREATE DATABASE IF NOT EXISTS cdc_test;
+CREATE TABLE IF NOT EXISTS cdc_test.heartbeat (
+    id INT NOT NULL PRIMARY KEY,
+    src_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+);
+INSERT INTO cdc_test.heartbeat (id, src_ts) VALUES (1, NOW(6))
+    ON DUPLICATE KEY UPDATE src_ts = NOW(6);
+"
+echo "Heartbeat table created on upstream"
+""", ctx, strict=False)
+
+
+def create_ticdc_changefeed(host: InstanceInfo, ctx: BootstrapContext):
+    log("Creating TiCDC changefeed to downstream cluster")
+    downstream_svc = f"{DOWNSTREAM_CLUSTER_NAME}-tidb.{DOWNSTREAM_NAMESPACE}.svc"
+
+    changefeed_toml = (
+        '[mounter]\n'
+        'worker-num = 32\n'
+        '\n'
+        '[scheduler]\n'
+        'enable-table-across-nodes = true\n'
+    )
+    toml_b64 = base64.b64encode(changefeed_toml.encode()).decode()
+
+    ssh_run(host, f"""
+TICDC_POD=$(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc -o jsonpath='{{.items[0].metadata.name}}' 2>/dev/null)
+if [ -z "$TICDC_POD" ]; then
+    echo "ERROR: No TiCDC pod found"
+    exit 1
+fi
+
+echo "TiCDC pod: $TICDC_POD"
+
+echo '{toml_b64}' | base64 -d > /tmp/changefeed.toml
+kubectl cp /tmp/changefeed.toml tidb-cluster/$TICDC_POD:/tmp/changefeed.toml
+
+for i in $(seq 1 30); do
+    STATUS=$(kubectl exec -n tidb-cluster $TICDC_POD -- /cdc cli capture list \
+        --server=http://127.0.0.1:8301 2>/dev/null | head -1)
+    if echo "$STATUS" | grep -q '"id"'; then
+        echo "TiCDC captures are registered"
+        break
+    fi
+    echo "Waiting for TiCDC captures... (attempt $i/30)"
+    sleep 10
+done
+
+kubectl exec -n tidb-cluster $TICDC_POD -- /cdc cli changefeed create \
+    --server=http://127.0.0.1:8301 \
+    --sink-uri="mysql://root@{downstream_svc}:4000/?worker-count=32&max-txn-row=512&batch-dml-enable=true" \
+    --changefeed-id="benchmark-replication" \
+    --config=/tmp/changefeed.toml
+
+echo "Changefeed created successfully"
+
+kubectl exec -n tidb-cluster $TICDC_POD -- /cdc cli changefeed list \
+    --server=http://127.0.0.1:8301
 """, ctx, strict=False)
 
 
@@ -1416,9 +1801,9 @@ def wait_for_ssh(node: InstanceInfo, ctx: BootstrapContext, max_attempts=30):
         if result.returncode == 0:
             return True
         if attempt < max_attempts - 1:
-            log(f"  {node.role} ({node.public_ip}) not ready yet (attempt {attempt + 1}/{max_attempts})...")
+            log(f"  {node.role} ({node.private_ip}) not ready yet (attempt {attempt + 1}/{max_attempts})...")
             time.sleep(10)
-    log(f"  WARNING: {node.role} ({node.public_ip}) did not become reachable after {max_attempts} attempts")
+    log(f"  WARNING: {node.role} ({node.private_ip}) did not become reachable after {max_attempts} attempts")
     return False
 
 
@@ -1468,9 +1853,18 @@ def main():
     log("=== Provisioning Network ===")
     vpc_id = ensure_vpc()
     igw_id = ensure_igw(vpc_id)
-    # Single subnet (all nodes in same subnet for simplicity & minimal latency)
-    public_subnet = ensure_subnet(vpc_id, f"{STACK}-public", PUB_CIDR, az=args.client_zone, public=True)
-    ensure_public_rtb(vpc_id, igw_id, public_subnet)
+    if multi_az:
+        az_subnets = {}
+        for az, cidr in SUBNET_CIDRS.items():
+            sid = ensure_subnet(vpc_id, f"{STACK}-public-{az}", cidr, az=az, public=True)
+            ensure_public_rtb(vpc_id, igw_id, sid)
+            az_subnets[az] = sid
+        subnet_ids = [az_subnets[az] for az in AVAILABILITY_ZONES]
+        public_subnet = az_subnets[args.client_zone]
+    else:
+        public_subnet = ensure_subnet(vpc_id, f"{STACK}-public", PUB_CIDR, az=args.client_zone, public=True)
+        ensure_public_rtb(vpc_id, igw_id, public_subnet)
+        subnet_ids = [public_subnet]
 
     # -----------------------------------------------------------------------
     # Security Group
@@ -1489,30 +1883,47 @@ def main():
     client_vol = ROOT_VOLUME_SIZES["client"]
     client_id = ensure_instance(f"{STACK}-client", "client", client_type, public_subnet, sg, client_vol)
 
-    pd_ids = provision_role_instances("pd", pd_replicas, types, public_subnet, sg, production)
-    tikv_ids = provision_role_instances("tikv", tikv_replicas, types, public_subnet, sg, production)
-    tidb_ids = provision_role_instances("tidb", tidb_replicas, types, public_subnet, sg, production)
+    pd_ids = provision_role_instances("pd", pd_replicas, types, subnet_ids, sg, production)
+    tikv_ids = provision_role_instances("tikv", tikv_replicas, types, subnet_ids, sg, production)
+    tidb_ids = provision_role_instances("tidb", tidb_replicas, types, subnet_ids, sg, production)
+
+    enable_ticdc = args.ticdc
+    ticdc_replicas = args.ticdc_replicas if enable_ticdc else 0
+    ticdc_ids = []
+    ds_pd_ids = []
+    ds_tikv_ids = []
+    ds_tidb_ids = []
+
+    if enable_ticdc:
+        log(f"TiCDC mode: provisioning {ticdc_replicas} TiCDC + downstream cluster instances")
+        ticdc_ids = provision_role_instances("ticdc", ticdc_replicas, types, subnet_ids, sg, production)
+        ds_pd_ids = provision_role_instances("downstream-pd", args.downstream_pd_replicas, types, subnet_ids, sg, production)
+        ds_tikv_ids = provision_role_instances("downstream-tikv", args.downstream_tikv_replicas, types, subnet_ids, sg, production)
+        ds_tidb_ids = provision_role_instances("downstream-tidb", args.downstream_tidb_replicas, types, subnet_ids, sg, production)
 
     # -----------------------------------------------------------------------
     # Gather Instance Information
     # -----------------------------------------------------------------------
     log("=== Gathering Instance Information ===")
-    time.sleep(10)  # Allow public IPs to propagate
+    time.sleep(10)
 
     client = instance_info_from_id(client_id, "client")
     pd_nodes = [instance_info_from_id(iid, f"pd-{i+1}") for i, iid in enumerate(pd_ids)]
     tikv_nodes = [instance_info_from_id(iid, f"tikv-{i+1}") for i, iid in enumerate(tikv_ids)]
     tidb_nodes = [instance_info_from_id(iid, f"tidb-{i+1}") for i, iid in enumerate(tidb_ids)]
+    ticdc_nodes = [instance_info_from_id(iid, f"ticdc-{i+1}") for i, iid in enumerate(ticdc_ids)]
+    ds_pd_nodes = [instance_info_from_id(iid, f"downstream-pd-{i+1}") for i, iid in enumerate(ds_pd_ids)]
+    ds_tikv_nodes = [instance_info_from_id(iid, f"downstream-tikv-{i+1}") for i, iid in enumerate(ds_tikv_ids)]
+    ds_tidb_nodes = [instance_info_from_id(iid, f"downstream-tidb-{i+1}") for i, iid in enumerate(ds_tidb_ids)]
 
     log(f"  client:  public={client.public_ip} private={client.private_ip}")
-    for n in pd_nodes:
+    for n in pd_nodes + tikv_nodes + tidb_nodes + ticdc_nodes:
         log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
-    for n in tikv_nodes:
-        log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
-    for n in tidb_nodes:
+    for n in ds_pd_nodes + ds_tikv_nodes + ds_tidb_nodes:
         log(f"  {n.role}: public={n.public_ip} private={n.private_ip}")
 
-    total_instances = 1 + len(pd_nodes) + len(tikv_nodes) + len(tidb_nodes)
+    all_nodes = [pd_nodes, tikv_nodes, tidb_nodes, ticdc_nodes, ds_pd_nodes, ds_tikv_nodes, ds_tidb_nodes]
+    total_instances = 1 + sum(len(ns) for ns in all_nodes)
     log(f"  Total instances: {total_instances}")
 
     if args.skip_bootstrap:
@@ -1530,10 +1941,19 @@ def main():
         pd_nodes=pd_nodes,
         tikv_nodes=tikv_nodes,
         tidb_nodes=tidb_nodes,
+        ticdc_nodes=ticdc_nodes,
+        downstream_pd_nodes=ds_pd_nodes,
+        downstream_tikv_nodes=ds_tikv_nodes,
+        downstream_tidb_nodes=ds_tidb_nodes,
         tidb_version=args.tidb_version,
         pd_replicas=pd_replicas,
         tikv_replicas=tikv_replicas,
         tidb_replicas=tidb_replicas,
+        ticdc_replicas=ticdc_replicas,
+        enable_ticdc=enable_ticdc,
+        downstream_pd_replicas=args.downstream_pd_replicas if enable_ticdc else 0,
+        downstream_tikv_replicas=args.downstream_tikv_replicas if enable_ticdc else 0,
+        downstream_tidb_replicas=args.downstream_tidb_replicas if enable_ticdc else 0,
         multi_az=multi_az,
         production=production,
         client_zone=args.client_zone,
@@ -1568,6 +1988,12 @@ def main():
     log("=== Labeling and Tainting Nodes ===")
     label_and_taint_nodes(ctx)
 
+    log("=== Installing Storage Provisioner ===")
+    install_local_path_provisioner(client, ctx)
+
+    if ctx.multi_az:
+        label_control_plane_zone(client, ctx)
+
     # -----------------------------------------------------------------------
     # TiDB Operator + Cluster
     # -----------------------------------------------------------------------
@@ -1593,6 +2019,17 @@ def main():
         log("=== Configuring Leader Zone Affinity ===")
         configure_leader_zone_affinity(client, ctx)
 
+    if ctx.enable_ticdc:
+        log("=== Deploying Downstream TiDB Cluster ===")
+        deploy_downstream_cluster(client, ctx)
+        wait_for_downstream_ready(client, ctx)
+
+        log("=== Creating CDC Heartbeat Table ===")
+        create_cdc_heartbeat_table(client, ctx)
+
+        log("=== Creating TiCDC Changefeed ===")
+        create_ticdc_changefeed(client, ctx)
+
     # -----------------------------------------------------------------------
     # Done
     # -----------------------------------------------------------------------
@@ -1613,6 +2050,16 @@ def main():
     log("  kubectl get nodes -o wide")
     log("  kubectl get pods -n tidb-cluster -o wide")
     log("  kubectl get tc -n tidb-cluster")
+
+    if ctx.enable_ticdc:
+        ds_tidb_ip = ds_tidb_nodes[0].public_ip if ds_tidb_nodes else client.public_ip
+        log("")
+        log(f"Downstream TiDB via NodePort: {ds_tidb_ip}:{DOWNSTREAM_NODEPORT}")
+        log(f"  kubectl get pods -n {DOWNSTREAM_NAMESPACE} -o wide")
+        log(f"  kubectl get tc -n {DOWNSTREAM_NAMESPACE}")
+        log("")
+        log("TiCDC changefeed status:")
+        log("  kubectl exec -n tidb-cluster $(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc -o jsonpath='{.items[0].metadata.name}') -- /cdc cli changefeed list --server=http://127.0.0.1:8301")
 
 
 if __name__ == "__main__":

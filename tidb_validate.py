@@ -169,6 +169,33 @@ def check_sysbench_installed(host: str, key_path: Path) -> bool:
     return result.returncode == 0 and "ok" in result.stdout
 
 
+def check_ticdc_ready(host: str, key_path: Path) -> bool:
+    result = ssh_capture(host, """
+kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc --no-headers 2>/dev/null | grep -c Running
+""", key_path)
+    try:
+        return int(result.stdout.strip()) > 0
+    except (ValueError, AttributeError):
+        return False
+
+
+def check_changefeed_status(host: str, key_path: Path) -> bool:
+    result = ssh_capture(host, """
+TICDC_POD=$(kubectl get pods -n tidb-cluster -l app.kubernetes.io/component=ticdc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+kubectl exec -n tidb-cluster "$TICDC_POD" -- /cdc cli changefeed list --server=http://127.0.0.1:8301 2>/dev/null
+""", key_path)
+    return result.returncode == 0 and "normal" in result.stdout
+
+
+def check_downstream_cluster(host: str, key_path: Path) -> bool:
+    result = ssh_capture(host, """
+PODS=$(kubectl get pods -n tidb-downstream --no-headers 2>/dev/null | grep -c Running)
+SVC=$(kubectl get svc downstream-tidb -n tidb-downstream -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+[ "$PODS" -gt 0 ] && [ -n "$SVC" ] && echo ok
+""", key_path)
+    return result.returncode == 0 and "ok" in result.stdout
+
+
 def run_quick_benchmark(host: str, key_path: Path, port: int) -> dict:
     log("Running quick validation benchmark (10s)...")
     
@@ -373,6 +400,21 @@ def main():
     tidb_ok = check_tidb_ready(host, key_path)
     checks.append(("TiDB Ready", tidb_ok))
     log(f"  TiDB Ready: {'PASS' if tidb_ok else 'FAIL'}")
+
+    ticdc_present = check_ticdc_ready(host, key_path)
+    if ticdc_present:
+        log("\n--- TiCDC Replication ---")
+
+        checks.append(("TiCDC Ready", True))
+        log(f"  TiCDC Ready: PASS")
+
+        cf_ok = check_changefeed_status(host, key_path)
+        checks.append(("Changefeed Normal", cf_ok))
+        log(f"  Changefeed Status: {'PASS' if cf_ok else 'FAIL'}")
+
+        ds_ok = check_downstream_cluster(host, key_path)
+        checks.append(("Downstream Cluster", ds_ok))
+        log(f"  Downstream Cluster: {'PASS' if ds_ok else 'FAIL'}")
     
     log("\n--- TiDB Database ---")
     

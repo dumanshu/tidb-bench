@@ -265,6 +265,108 @@ class CostTracker:
         log("      Actual costs may vary with reserved instances or savings plans.")
         log("=" * 70)
 
+class CdcLagTracker:
+
+    def __init__(self, host: str, key_path: Path,
+                 upstream_svc: str = "basic-tidb",
+                 upstream_ns: str = "tidb-cluster",
+                 downstream_svc: str = "downstream-tidb",
+                 downstream_ns: str = "tidb-downstream",
+                 downstream_port: int = DEFAULT_PORT,
+                 interval: float = 1.0):
+        self.host = host
+        self.key_path = key_path
+        self.upstream_svc = upstream_svc
+        self.upstream_ns = upstream_ns
+        self.downstream_svc = downstream_svc
+        self.downstream_ns = downstream_ns
+        self.downstream_port = downstream_port
+        self.interval = interval
+        self._samples: list[float] = []
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _measure(self):
+        script = f"""
+UPSTREAM_IP=$(kubectl get svc {self.upstream_svc} -n {self.upstream_ns} -o jsonpath='{{.spec.clusterIP}}')
+DOWNSTREAM_IP=$(kubectl get svc {self.downstream_svc} -n {self.downstream_ns} -o jsonpath='{{.spec.clusterIP}}')
+
+mysql -h "$UPSTREAM_IP" -P 4000 -u root -N -e \
+  "UPDATE cdc_test.heartbeat SET src_ts=NOW(6) WHERE id=1; SELECT src_ts FROM cdc_test.heartbeat WHERE id=1;" 2>/dev/null | tail -1
+
+sleep 0.2
+
+mysql -h "$DOWNSTREAM_IP" -P {self.downstream_port} -u root -N -e \
+  "SELECT src_ts FROM cdc_test.heartbeat WHERE id=1;" 2>/dev/null
+"""
+        result = ssh_capture(self.host, script, self.key_path)
+        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        if len(lines) < 2:
+            return None
+        try:
+            from datetime import datetime as _dt
+            fmt = "%Y-%m-%d %H:%M:%S.%f"
+            up_ts = _dt.strptime(lines[0], fmt)
+            down_ts = _dt.strptime(lines[1], fmt)
+            return (up_ts - down_ts).total_seconds()
+        except (ValueError, IndexError):
+            return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                lag = self._measure()
+                if lag is not None and lag >= 0:
+                    self._samples.append(lag)
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def start(self):
+        log("Starting TiCDC lag tracker...")
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        log(f"TiCDC lag tracker stopped ({len(self._samples)} samples)")
+
+    def summary(self) -> dict:
+        if not self._samples:
+            return {}
+        s = sorted(self._samples)
+        n = len(s)
+        return {
+            "samples": n,
+            "min": s[0],
+            "avg": sum(s) / n,
+            "p50": s[int(n * 0.50)],
+            "p95": s[int(n * 0.95)],
+            "p99": s[min(int(n * 0.99), n - 1)],
+            "max": s[-1],
+        }
+
+    def print_summary(self):
+        data = self.summary()
+        if not data:
+            log("TiCDC Lag: no samples collected")
+            return
+        log("")
+        log("=" * 70)
+        log("TICDC REPLICATION LAG")
+        log("=" * 70)
+        log(f"Samples: {data['samples']}")
+        log(f"  Min:  {data['min']:.3f}s")
+        log(f"  Avg:  {data['avg']:.3f}s")
+        log(f"  P50:  {data['p50']:.3f}s")
+        log(f"  P95:  {data['p95']:.3f}s")
+        log(f"  P99:  {data['p99']:.3f}s")
+        log(f"  Max:  {data['max']:.3f}s")
+        log("=" * 70)
+
+
 WORKLOAD_PROFILES = {
     "quick": {"tables": 4, "table_size": 10000, "threads": 16, "duration": 30, "disk_fill_pct": 30},
     "light": {"tables": 8, "table_size": 50000, "threads": 32, "duration": 60, "disk_fill_pct": 30},
@@ -1790,6 +1892,22 @@ def parse_args():
         help="Output log file path (auto-generates if not specified, use 'none' to disable)",
     )
 
+    parser.add_argument(
+        "--ticdc",
+        action="store_true",
+        help="Enable TiCDC replication lag tracking during benchmark",
+    )
+    parser.add_argument(
+        "--downstream-host",
+        help="Downstream TiDB cluster IP (auto-discovered via kubectl if not provided)",
+    )
+    parser.add_argument(
+        "--downstream-port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Downstream TiDB port (default: {DEFAULT_PORT})",
+    )
+
     return parser.parse_args()
 
 
@@ -1873,7 +1991,11 @@ def _run_benchmark(args):
             disk_fill_pct = 30  # default
 
     # Print cluster summary and get instance info for cost tracking
-    print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
+    try:
+        print_cluster_summary(host, key_path, args.region, args.aws_profile, args.seed, args.port)
+    except Exception as exc:
+        log(f"WARNING: Could not fetch cluster summary (AWS creds may be expired): {exc}")
+        log("Continuing with benchmark...")
 
     # Pre-flight: disable resource control to avoid error 8249
     log("Disabling TiDB resource control (avoids error 8249)...")
@@ -1884,7 +2006,10 @@ mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_co
 
     # Initialize cost tracker
     cost_tracker = CostTracker(region=args.region)
-    inst_info = get_instance_info(args.region, args.aws_profile, args.seed)
+    try:
+        inst_info = get_instance_info(args.region, args.aws_profile, args.seed)
+    except Exception:
+        inst_info = {}
 
     # Determine instance types per role
     role_types = {}
@@ -1904,6 +2029,9 @@ mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_co
     server_count = (cluster_info.get("tidb_count", 2) +
                     cluster_info.get("tikv_count", 3) +
                     cluster_info.get("pd_count", 3))
+    if args.ticdc:
+        # Default TiCDC setup: 1 TiCDC + downstream (3 PD + 3 TiKV + 1 TiDB) = 8 nodes
+        server_count += 8
 
     # Auto-detect actual EBS volume size from the host
     _disk_probe = get_disk_utilization(host, key_path, args.port, DEFAULT_EBS_SIZE_GB, database)
@@ -1918,6 +2046,15 @@ mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_co
     )
 
     benchmark_start_time = time.time()
+
+    cdc_tracker = None
+    if args.ticdc:
+        cdc_tracker = CdcLagTracker(
+            host=host,
+            key_path=key_path,
+            downstream_port=args.downstream_port,
+        )
+        cdc_tracker.start()
 
     # ── PHASE 1: BULK DATA LOAD ──────────────────────────────────────────
     # Fill disk to target utilization so the benchmark runs against a
@@ -2050,6 +2187,10 @@ mysql -h 127.0.0.1 -P {args.port} -u root -e "SET GLOBAL tidb_enable_resource_co
 
     # Print cost summary
     cost_tracker.print_summary(actual_duration)
+
+    if cdc_tracker:
+        cdc_tracker.stop()
+        cdc_tracker.print_summary()
 
     if args.cleanup:
         run_sysbench_cleanup(host, key_path, args.tables, args.port, database)
